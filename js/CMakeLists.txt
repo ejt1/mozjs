@@ -4,7 +4,11 @@
 add_definitions(-DSTATIC_JS_API)
 add_definitions(-DJS_DEFAULT_JITREPORT_GRANULARITY=3)
 add_definitions(-DWIN32)
-add_definitions(-D_AMD64_)
+if(CMAKE_SIZEOF_VOID_P MATCHES 8)
+  add_definitions(-D_AMD64_)
+else()
+  add_definitions(-D_X86_)
+endif()
 ## End definitions
 ###############################################################################
 ## Begin source files
@@ -282,8 +286,8 @@ add_dependencies(js host_jsoplengen)
 target_include_directories(js
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/assembler
-    ${CMAKE_SOURCE_DIR}/intl/icu/src/common
-    ${CMAKE_SOURCE_DIR}/intl/icu/src/i18n
+    ${CMAKE_CURRENT_SOURCE_DIR}/../intl/icu/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../intl/icu/src/i18n
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/public
     # $:/src and BIN_DIR should be private but make public for now until
