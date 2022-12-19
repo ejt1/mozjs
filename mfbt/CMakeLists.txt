@@ -20,6 +20,9 @@ target_include_directories(mfbt
 
 target_compile_definitions(mfbt PUBLIC -DIMPL_MFBT)
 
+install(TARGETS mfbt
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+
 set(MFBT_PUBLIC_HDRS
   src/mozilla/Assertions.h
   src/mozilla/Attributes.h
