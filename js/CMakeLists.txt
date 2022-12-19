@@ -1,9 +1,13 @@
+###############################################################################
+## Begin definitions
 # TODO: Just temporarily define these to successfully compile and move later.
 add_definitions(-DSTATIC_JS_API)
 add_definitions(-DJS_DEFAULT_JITREPORT_GRANULARITY=3)
 add_definitions(-DWIN32)
 add_definitions(-D_AMD64_)
-
+## End definitions
+###############################################################################
+## Begin source files
 set(JS_SRCS
   src/builtin/Eval.cpp
   src/builtin/Intl.cpp
@@ -268,7 +272,9 @@ if(JS_HAS_CTYPES)
     src/ctypes/CTypes.cpp
     src/ctypes/Library.cpp)
 endif()
-
+## End source files
+###############################################################################
+## Begin static library
 add_library(js ${JS_SRCS})
 
 add_dependencies(js host_jsoplengen)
@@ -290,7 +296,9 @@ target_link_libraries(js PUBLIC mfbt)
 if(WIN32)
   target_link_libraries(js PUBLIC winmm)
 endif()
-
+## End static library
+###############################################################################
+## Begin auto-generated files
 configure_file(js-config.h.in js-config.h)
 
 add_executable(host_jskwgen src/jskwgen.cpp)
@@ -338,3 +346,40 @@ add_custom_command(
 
 set_source_files_properties(selfhosted.out.h PROPERTIES GENERATED TRUE)
 target_sources(js PRIVATE selfhosted.out.h)
+## End auto-generated files
+###############################################################################
+## Begin install directives
+install(TARGETS js
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/public/js"
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/include)
+
+set(JS_PUBLIC_HDRS
+  ${CMAKE_CURRENT_BINARY_DIR}/js-config.h
+  src/js.msg
+  src/jsapi.h
+  src/jsalloc.h
+  src/jsclass.h
+  src/jsclist.h
+  src/jscpucfg.h
+  src/jsdbgapi.h
+  src/jsdhash.h
+  src/jsfriendapi.h
+  src/jslock.h
+  src/json.h
+  src/jsproxy.h
+  src/jsprf.h
+  src/jsprototypes.h
+  src/jsprvtd.h
+  src/jspubtd.h
+  src/jstypes.h
+  src/jstypes.h
+  src/jsutil.h
+  src/jsutil.h
+  src/jsversion.h
+  src/jswrapper.h)
+
+install(FILES ${JS_PUBLIC_HDRS}
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/include)
+## End install directives
+###############################################################################
