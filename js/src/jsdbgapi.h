@@ -231,6 +231,9 @@ JS_GetScriptUserBit(JSScript *script);
 extern JS_PUBLIC_API(void)
 JS_SetScriptUserBit(JSScript *script, bool b);
 
+extern JS_PUBLIC_API(bool)
+JS_GetScriptIsSelfHosted(JSScript *script);
+
 /************************************************************************/
 
 /*
@@ -428,6 +431,17 @@ JS_SetThrowHook(JSRuntime *rt, JSThrowHook hook, void *closure);
 
 extern JS_PUBLIC_API(JSBool)
 JS_SetDebugErrorHook(JSRuntime *rt, JSDebugErrorHook hook, void *closure);
+
+/************************************************************************/
+
+extern JS_PUBLIC_API(size_t)
+JS_GetObjectTotalSize(JSContext *cx, JSObject *obj);
+
+extern JS_PUBLIC_API(size_t)
+JS_GetFunctionTotalSize(JSContext *cx, JSFunction *fun);
+
+extern JS_PUBLIC_API(size_t)
+JS_GetScriptTotalSize(JSContext *cx, JSScript *script);
 
 /************************************************************************/
 

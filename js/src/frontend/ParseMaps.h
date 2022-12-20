@@ -421,7 +421,10 @@ typedef AtomDefnListMap::Range  AtomDefnListRange;
 namespace mozilla {
 
 template <>
-struct IsPod<js::frontend::DefinitionList> : TrueType {};
+struct IsPod<js::frontend::DefinitionList>
+{
+    static const bool value = true;
+};
 
 } /* namespace mozilla */
 

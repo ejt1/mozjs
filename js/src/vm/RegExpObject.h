@@ -313,8 +313,6 @@ class RegExpObject : public JSObject
 
     /* Accessors. */
 
-    static unsigned lastIndexSlot() { return LAST_INDEX_SLOT; }
-
     const Value &getLastIndex() const { return getSlot(LAST_INDEX_SLOT); }
     inline void setLastIndex(double d);
     inline void zeroLastIndex();
@@ -356,7 +354,7 @@ class RegExpObject : public JSObject
      * encoding their initial properties. Return the shape after
      * changing this regular expression object's last property to it.
      */
-    RawShape assignInitialShape(JSContext *cx);
+    UnrootedShape assignInitialShape(JSContext *cx);
 
     bool init(JSContext *cx, HandleAtom source, RegExpFlag flags);
 
@@ -389,7 +387,7 @@ ParseRegExpFlags(JSContext *cx, JSString *flagStr, RegExpFlag *flagsOut);
  * to be the private of any RegExpObject.
  */
 inline bool
-RegExpToShared(JSContext *cx, HandleObject obj, RegExpGuard *g);
+RegExpToShared(JSContext *cx, JSObject &obj, RegExpGuard *g);
 
 template<XDRMode mode>
 bool

@@ -35,7 +35,7 @@ AssertInnerizedScopeChain(JSContext *cx, JSObject &scopeobj)
 }
 
 static bool
-IsEvalCacheCandidate(RawScript script)
+IsEvalCacheCandidate(UnrootedScript script)
 {
     // Make sure there are no inner objects which might use the wrong parent
     // and/or call scope by reusing the previous eval's script. Skip the
@@ -50,16 +50,15 @@ IsEvalCacheCandidate(RawScript script)
 EvalCacheHashPolicy::hash(const EvalCacheLookup &l)
 {
     return AddToHash(HashString(l.str->chars(), l.str->length()),
-                     l.callerScript.get(),
+                     l.caller,
+                     l.staticLevel,
                      l.version,
-                     l.pc);
+                     l.compartment);
 }
 
 /* static */ bool
-EvalCacheHashPolicy::match(const EvalCacheEntry &cacheEntry, const EvalCacheLookup &l)
+EvalCacheHashPolicy::match(UnrootedScript script, const EvalCacheLookup &l)
 {
-    JSScript *script = cacheEntry.script;
-
     JS_ASSERT(IsEvalCacheCandidate(script));
 
     // Get the source string passed for safekeeping in the atom map
@@ -67,9 +66,10 @@ EvalCacheHashPolicy::match(const EvalCacheEntry &cacheEntry, const EvalCacheLook
     JSAtom *keyStr = script->atoms[0];
 
     return EqualStrings(keyStr, l.str) &&
-           cacheEntry.callerScript == l.callerScript &&
+           script->getCallerFunction() == l.caller &&
+           script->staticLevel == l.staticLevel &&
            script->getVersion() == l.version &&
-           cacheEntry.pc == l.pc;
+           script->compartment() == l.compartment;
 }
 
 // There are two things we want to do with each script executed in EvalKernel:
@@ -93,30 +93,33 @@ class EvalScriptGuard
 
   public:
     EvalScriptGuard(JSContext *cx)
-        : cx_(cx), script_(cx), lookup_(cx), lookupStr_(cx) {}
+      : cx_(cx), script_(cx), lookupStr_(cx)
+    {
+        lookup_.str = NULL;
+    }
 
     ~EvalScriptGuard() {
         if (script_) {
             CallDestroyScriptHook(cx_->runtime->defaultFreeOp(), script_);
             script_->isActiveEval = false;
             script_->isCachedEval = true;
-            EvalCacheEntry cacheEntry = {script_, lookup_.callerScript, lookup_.pc};
             lookup_.str = lookupStr_;
             if (lookup_.str && IsEvalCacheCandidate(script_))
-                cx_->runtime->evalCache.relookupOrAdd(p_, lookup_, cacheEntry);
+                cx_->runtime->evalCache.relookupOrAdd(p_, lookup_, script_);
         }
     }
 
-    void lookupInEvalCache(JSLinearString *str, JSScript *callerScript, jsbytecode *pc)
+    void lookupInEvalCache(JSLinearString *str, JSFunction *caller, unsigned staticLevel)
     {
         lookupStr_ = str;
         lookup_.str = str;
-        lookup_.callerScript = callerScript;
+        lookup_.caller = caller;
+        lookup_.staticLevel = staticLevel;
         lookup_.version = cx_->findVersion();
-        lookup_.pc = pc;
+        lookup_.compartment = cx_->compartment;
         p_ = cx_->runtime->evalCache.lookupForAdd(lookup_);
         if (p_) {
-            script_ = p_->script;
+            script_ = *p_;
             cx_->runtime->evalCache.remove(p_);
             CallNewScriptHook(cx_, script_, NullPtr());
             script_->isCachedEval = false;
@@ -124,7 +127,7 @@ class EvalScriptGuard
         }
     }
 
-    void setNewScript(RawScript script) {
+    void setNewScript(UnrootedScript script) {
         // JSScript::initFromEmitter has already called js_CallNewScriptHook.
         JS_ASSERT(!script_ && script);
         script_ = script;
@@ -141,57 +144,6 @@ class EvalScriptGuard
     }
 };
 
-enum EvalJSONResult {
-    EvalJSON_Failure,
-    EvalJSON_Success,
-    EvalJSON_NotJSON
-};
-
-static EvalJSONResult
-TryEvalJSON(JSContext *cx, JSScript *callerScript,
-            StableCharPtr chars, size_t length, MutableHandleValue rval)
-{
-    // If the eval string starts with '(' or '[' and ends with ')' or ']', it may be JSON.
-    // Try the JSON parser first because it's much faster.  If the eval string
-    // isn't JSON, JSON parsing will probably fail quickly, so little time
-    // will be lost.
-    //
-    // Don't use the JSON parser if the caller is strict mode code, because in
-    // strict mode object literals must not have repeated properties, and the
-    // JSON parser cheerfully (and correctly) accepts them.  If you're parsing
-    // JSON with eval and using strict mode, you deserve to be slow.
-    if (length > 2 &&
-        ((chars[0] == '[' && chars[length - 1] == ']') ||
-        (chars[0] == '(' && chars[length - 1] == ')')) &&
-         (!callerScript || !callerScript->strict))
-    {
-        // Remarkably, JavaScript syntax is not a superset of JSON syntax:
-        // strings in JavaScript cannot contain the Unicode line and paragraph
-        // terminator characters U+2028 and U+2029, but strings in JSON can.
-        // Rather than force the JSON parser to handle this quirk when used by
-        // eval, we simply don't use the JSON parser when either character
-        // appears in the provided string.  See bug 657367.
-        for (const jschar *cp = &chars[1], *end = &chars[length - 2]; ; cp++) {
-            if (*cp == 0x2028 || *cp == 0x2029)
-                break;
-
-            if (cp == end) {
-                bool isArray = (chars[0] == '[');
-                JSONParser parser(cx, isArray ? chars : chars + 1U, isArray ? length : length - 2,
-                                  JSONParser::StrictJSON, JSONParser::NoError);
-                RootedValue tmp(cx);
-                if (!parser.parse(&tmp))
-                    return EvalJSON_Failure;
-                if (tmp.isUndefined())
-                    return EvalJSON_NotJSON;
-                rval.set(tmp);
-                return EvalJSON_Success;
-            }
-        }
-    }
-    return EvalJSON_NotJSON;
-}
-
 // Define subset of ExecuteType so that casting performs the injection.
 enum EvalType { DIRECT_EVAL = EXECUTE_DIRECT_EVAL, INDIRECT_EVAL = EXECUTE_INDIRECT_EVAL };
 
@@ -205,10 +157,9 @@ enum EvalType { DIRECT_EVAL = EXECUTE_DIRECT_EVAL, INDIRECT_EVAL = EXECUTE_INDIR
 // On success, store the completion value in call.rval and return true.
 static bool
 EvalKernel(JSContext *cx, const CallArgs &args, EvalType evalType, AbstractFramePtr caller,
-           HandleObject scopeobj, jsbytecode *pc)
+           HandleObject scopeobj)
 {
     JS_ASSERT((evalType == INDIRECT_EVAL) == !caller);
-    JS_ASSERT((evalType == INDIRECT_EVAL) == !pc);
     JS_ASSERT_IF(evalType == INDIRECT_EVAL, scopeobj->isGlobal());
     AssertInnerizedScopeChain(cx, *scopeobj);
 
@@ -264,17 +215,51 @@ EvalKernel(JSContext *cx, const CallArgs &args, EvalType evalType, AbstractFrame
     StableCharPtr chars = stableStr->chars();
     size_t length = stableStr->length();
 
-    JSPrincipals *principals = PrincipalsForCompiledCode(args, cx);
+    // If the eval string starts with '(' or '[' and ends with ')' or ']', it may be JSON.
+    // Try the JSON parser first because it's much faster.  If the eval string
+    // isn't JSON, JSON parsing will probably fail quickly, so little time
+    // will be lost.
+    //
+    // Don't use the JSON parser if the caller is strict mode code, because in
+    // strict mode object literals must not have repeated properties, and the
+    // JSON parser cheerfully (and correctly) accepts them.  If you're parsing
+    // JSON with eval and using strict mode, you deserve to be slow.
+    if (length > 2 &&
+        ((chars[0] == '[' && chars[length - 1] == ']') ||
+        (chars[0] == '(' && chars[length - 1] == ')')) &&
+         (!caller || !caller.script()->strict))
+    {
+        // Remarkably, JavaScript syntax is not a superset of JSON syntax:
+        // strings in JavaScript cannot contain the Unicode line and paragraph
+        // terminator characters U+2028 and U+2029, but strings in JSON can.
+        // Rather than force the JSON parser to handle this quirk when used by
+        // eval, we simply don't use the JSON parser when either character
+        // appears in the provided string.  See bug 657367.
+        for (const jschar *cp = &chars[1], *end = &chars[length - 2]; ; cp++) {
+            if (*cp == 0x2028 || *cp == 0x2029)
+                break;
 
-    JSScript *callerScript = caller ? caller.script() : NULL;
-    EvalJSONResult ejr = TryEvalJSON(cx, callerScript, chars, length, args.rval());
-    if (ejr != EvalJSON_NotJSON)
-        return ejr == EvalJSON_Success;
+            if (cp == end) {
+                bool isArray = (chars[0] == '[');
+                JSONParser parser(cx, isArray ? chars : chars + 1U, isArray ? length : length - 2,
+                                  JSONParser::StrictJSON, JSONParser::NoError);
+                RootedValue tmp(cx);
+                if (!parser.parse(&tmp))
+                    return false;
+                if (tmp.isUndefined())
+                    break;
+                args.rval().set(tmp);
+                return true;
+            }
+        }
+    }
 
     EvalScriptGuard esg(cx);
 
+    JSPrincipals *principals = PrincipalsForCompiledCode(args, cx);
+
     if (evalType == DIRECT_EVAL && caller.isNonEvalFunctionFrame())
-        esg.lookupInEvalCache(stableStr, callerScript, pc);
+        esg.lookupInEvalCache(stableStr, caller.fun(), staticLevel);
 
     if (!esg.foundScript()) {
         unsigned lineno;
@@ -290,9 +275,8 @@ EvalKernel(JSContext *cx, const CallArgs &args, EvalType evalType, AbstractFrame
                .setNoScriptRval(false)
                .setPrincipals(principals)
                .setOriginPrincipals(originPrincipals);
-        RootedScript callerScript(cx, caller ? caller.script() : NULL);
-        RawScript compiled = frontend::CompileScript(cx, scopeobj, callerScript, options,
-                                                     chars.get(), length, stableStr, staticLevel);
+        UnrootedScript compiled = frontend::CompileScript(cx, scopeobj, caller, options,
+                                                          chars.get(), length, stableStr, staticLevel);
         if (!compiled)
             return false;
 
@@ -301,71 +285,6 @@ EvalKernel(JSContext *cx, const CallArgs &args, EvalType evalType, AbstractFrame
 
     return ExecuteKernel(cx, esg.script(), *scopeobj, thisv, ExecuteType(evalType),
                          NullFramePtr() /* evalInFrame */, args.rval().address());
-}
-
-bool
-js::DirectEvalFromIon(JSContext *cx,
-                      HandleObject scopeobj, HandleScript callerScript,
-                      HandleValue thisValue, HandleString str,
-                      jsbytecode *pc, MutableHandleValue vp)
-{
-    AssertInnerizedScopeChain(cx, *scopeobj);
-
-    Rooted<GlobalObject*> scopeObjGlobal(cx, &scopeobj->global());
-    if (!GlobalObject::isRuntimeCodeGenEnabled(cx, scopeObjGlobal)) {
-        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_CSP_BLOCKED_EVAL);
-        return false;
-    }
-
-    // ES5 15.1.2.1 steps 2-8.
-
-    unsigned staticLevel = callerScript->staticLevel + 1;
-
-    Rooted<JSStableString*> stableStr(cx, str->ensureStable(cx));
-    if (!stableStr)
-        return false;
-
-    StableCharPtr chars = stableStr->chars();
-    size_t length = stableStr->length();
-
-    EvalJSONResult ejr = TryEvalJSON(cx, callerScript, chars, length, vp);
-    if (ejr != EvalJSON_NotJSON)
-        return ejr == EvalJSON_Success;
-
-    EvalScriptGuard esg(cx);
-
-    // Ion will not perform cross compartment direct eval calls.
-    JSPrincipals *principals = cx->compartment->principals;
-
-    esg.lookupInEvalCache(stableStr, callerScript, pc);
-
-    if (!esg.foundScript()) {
-        unsigned lineno;
-        const char *filename;
-        JSPrincipals *originPrincipals;
-        CurrentScriptFileLineOrigin(cx, &filename, &lineno, &originPrincipals,
-                                    CALLED_FROM_JSOP_EVAL);
-
-        CompileOptions options(cx);
-        options.setFileAndLine(filename, lineno)
-               .setCompileAndGo(true)
-               .setNoScriptRval(false)
-               .setPrincipals(principals)
-               .setOriginPrincipals(originPrincipals);
-        RawScript compiled = frontend::CompileScript(cx, scopeobj, callerScript, options,
-                                                     chars.get(), length, stableStr, staticLevel);
-        if (!compiled)
-            return false;
-
-        esg.setNewScript(compiled);
-    }
-
-    // Primitive 'this' values should have been filtered out by Ion. If boxed,
-    // the calling frame cannot be updated to store the new object.
-    JS_ASSERT(thisValue.isObject() || thisValue.isUndefined() || thisValue.isNull());
-
-    return ExecuteKernel(cx, esg.script(), *scopeobj, thisValue, ExecuteType(DIRECT_EVAL),
-                         NullFramePtr() /* evalInFrame */, vp.address());
 }
 
 // We once supported a second argument to eval to use as the scope chain
@@ -400,26 +319,23 @@ js::IndirectEval(JSContext *cx, unsigned argc, Value *vp)
         return false;
 
     Rooted<GlobalObject*> global(cx, &args.callee().global());
-    return EvalKernel(cx, args, INDIRECT_EVAL, NullFramePtr(), global, NULL);
+    return EvalKernel(cx, args, INDIRECT_EVAL, NullFramePtr(), global);
 }
 
 bool
 js::DirectEval(JSContext *cx, const CallArgs &args)
 {
-    // Direct eval can assume it was called from an interpreted or baseline frame.
-    ScriptFrameIter iter(cx);
-    AbstractFramePtr caller = iter.abstractFramePtr();
-
-    JS_ASSERT(IsBuiltinEvalForScope(caller.scopeChain(), args.calleev()));
-    JS_ASSERT(JSOp(*iter.pc()) == JSOP_EVAL);
-    JS_ASSERT_IF(caller.isFunctionFrame(),
-                 caller.compartment() == caller.callee()->compartment());
+    // Direct eval can assume it was called from an interpreted frame.
+    StackFrame *caller = cx->fp();
+    JS_ASSERT(IsBuiltinEvalForScope(caller->scopeChain(), args.calleev()));
+    JS_ASSERT(JSOp(*cx->regs().pc) == JSOP_EVAL);
+    JS_ASSERT_IF(caller->isFunctionFrame(),
+                 caller->compartment() == caller->callee().compartment());
 
     if (!WarnOnTooManyArgs(cx, args))
         return false;
 
-    RootedObject scopeChain(cx, caller.scopeChain());
-    return EvalKernel(cx, args, DIRECT_EVAL, caller, scopeChain, iter.pc());
+    return EvalKernel(cx, args, DIRECT_EVAL, caller, caller->scopeChain());
 }
 
 bool

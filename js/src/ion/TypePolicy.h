@@ -106,8 +106,7 @@ class PowPolicy : public BoxInputsPolicy
     bool adjustInputs(MInstruction *ins);
 };
 
-// Expect a string for operand Op. If the input is a Value, it is unboxed.
-template <unsigned Op>
+// Single-string input. If the input is a Value, it is unboxed.
 class StringPolicy : public BoxInputsPolicy
 {
   public:
@@ -202,15 +201,6 @@ class InstanceOfPolicy : public TypePolicy
 };
 
 class StoreTypedArrayPolicy : public BoxInputsPolicy
-{
-  protected:
-    bool adjustValueInput(MInstruction *ins, int arrayType, MDefinition *value, int valueOperand);
-
-  public:
-    bool adjustInputs(MInstruction *ins);
-};
-
-class StoreTypedArrayHolePolicy : public StoreTypedArrayPolicy
 {
   public:
     bool adjustInputs(MInstruction *ins);

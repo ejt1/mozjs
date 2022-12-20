@@ -36,27 +36,24 @@ LICM::analyze()
             continue;
 
         // Attempt to optimize loop.
-        Loop loop(mir, header->backedge(), header);
+        Loop loop(mir, header->backedge(), header, graph);
 
         Loop::LoopReturn lr = loop.init();
         if (lr == Loop::LoopReturn_Error)
             return false;
-        if (lr == Loop::LoopReturn_Skip) {
-            graph.unmarkBlocks();
+        if (lr == Loop::LoopReturn_Skip)
             continue;
-        }
 
         if (!loop.optimize())
             return false;
-
-        graph.unmarkBlocks();
     }
 
     return true;
 }
 
-Loop::Loop(MIRGenerator *mir, MBasicBlock *footer, MBasicBlock *header)
+Loop::Loop(MIRGenerator *mir, MBasicBlock *footer, MBasicBlock *header, MIRGraph &graph)
   : mir(mir),
+    graph(graph),
     footer_(footer),
     header_(header)
 {
@@ -76,6 +73,7 @@ Loop::init()
     if (lr == LoopReturn_Error)
         return LoopReturn_Error;
 
+    graph.unmarkBlocks();
     return lr;
 }
 
@@ -196,31 +194,19 @@ Loop::hoistInstructions(InstructionQueue &toHoist)
 bool
 Loop::isInLoop(MDefinition *ins)
 {
-    return ins->block()->isMarked();
-}
-
-bool
-Loop::isBeforeLoop(MDefinition *ins)
-{
-    return ins->block()->id() < header_->id();
+    return ins->block()->id() >= header_->id();
 }
 
 bool
 Loop::isLoopInvariant(MInstruction *ins)
 {
-    if (!isHoistable(ins)) {
-        if (IonSpewEnabled(IonSpew_LICM))
-            fprintf(IonSpewFile, "not hoistable\n");
+    if (!isHoistable(ins))
         return false;
-    }
 
-    // Don't hoist if this instruction depends on a store inside or after the loop.
-    // Note: "after the loop" can sound strange, but Alias Analysis doesn't look
-    // at the control flow. Therefore it doesn't match the definition here, that a block
-    // is in the loop when there is a (directed) path from the block to the loop header.
-    if (ins->dependency() && !isBeforeLoop(ins->dependency())) {
+    // Don't hoist if this instruction depends on a store inside the loop.
+    if (ins->dependency() && isInLoop(ins->dependency())) {
         if (IonSpewEnabled(IonSpew_LICM)) {
-            fprintf(IonSpewFile, "depends on store inside or after loop: ");
+            fprintf(IonSpewFile, "depends on store inside loop: ");
             ins->dependency()->printName(IonSpewFile);
             fprintf(IonSpewFile, "\n");
         }

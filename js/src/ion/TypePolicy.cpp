@@ -160,17 +160,13 @@ ComparePolicy::adjustInputs(MInstruction *def)
         return true;
     }
 
-    if (compare->compareType() == MCompare::Compare_Undefined ||
-        compare->compareType() == MCompare::Compare_Null)
-    {
-        // Nothing to do for undefined and null, lowering handles all types.
-        return true;
-    }
-
     // Convert all inputs to the right input type
     MIRType type = compare->inputType();
-    JS_ASSERT(type == MIRType_Int32 || type == MIRType_Double ||
-              type == MIRType_Object || type == MIRType_String);
+
+    // Nothing to do for undefined and null, lowering handles all types.
+    if (type == MIRType_Undefined || type == MIRType_Null)
+        return true;
+
     for (size_t i = 0; i < 2; i++) {
         MDefinition *in = def->getOperand(i);
         if (in->type() == type)
@@ -278,11 +274,10 @@ PowPolicy::adjustInputs(MInstruction *ins)
     return IntPolicy<1>::staticAdjustInputs(ins);
 }
 
-template <unsigned Op>
 bool
-StringPolicy<Op>::staticAdjustInputs(MInstruction *def)
+StringPolicy::staticAdjustInputs(MInstruction *def)
 {
-    MDefinition *in = def->getOperand(Op);
+    MDefinition *in = def->getOperand(0);
     if (in->type() == MIRType_String)
         return true;
 
@@ -296,12 +291,9 @@ StringPolicy<Op>::staticAdjustInputs(MInstruction *def)
     }
 
     def->block()->insertBefore(def, replace);
-    def->replaceOperand(Op, replace);
+    def->replaceOperand(0, replace);
     return true;
 }
-
-template bool StringPolicy<0>::staticAdjustInputs(MInstruction *ins);
-template bool StringPolicy<1>::staticAdjustInputs(MInstruction *ins);
 
 template <unsigned Op>
 bool
@@ -397,6 +389,8 @@ ObjectPolicy<Op>::staticAdjustInputs(MInstruction *ins)
 
 template bool ObjectPolicy<0>::staticAdjustInputs(MInstruction *ins);
 template bool ObjectPolicy<1>::staticAdjustInputs(MInstruction *ins);
+template bool ObjectPolicy<2>::staticAdjustInputs(MInstruction *ins);
+template bool ObjectPolicy<3>::staticAdjustInputs(MInstruction *ins);
 
 bool
 CallPolicy::adjustInputs(MInstruction *ins)
@@ -447,10 +441,15 @@ InstanceOfPolicy::adjustInputs(MInstruction *def)
 }
 
 bool
-StoreTypedArrayPolicy::adjustValueInput(MInstruction *ins, int arrayType,
-                                        MDefinition *value, int valueOperand)
+StoreTypedArrayPolicy::adjustInputs(MInstruction *ins)
 {
-    MDefinition *curValue = value;
+    MStoreTypedArrayElement *store = ins->toStoreTypedArrayElement();
+    JS_ASSERT(store->elements()->type() == MIRType_Elements);
+    JS_ASSERT(store->index()->type() == MIRType_Int32);
+
+    int arrayType = store->arrayType();
+    MDefinition *value = store->value();
+
     // First, ensure the value is int32, boolean, double or Value.
     // The conversion is based on TypedArrayTemplate::setElementTail.
     switch (value->type()) {
@@ -478,10 +477,8 @@ StoreTypedArrayPolicy::adjustValueInput(MInstruction *ins, int arrayType,
         break;
     }
 
-    if (value != curValue) {
-        ins->replaceOperand(valueOperand, value);
-        curValue = value;
-    }
+    if (value != store->value())
+        ins->replaceOperand(2, value);
 
     JS_ASSERT(value->type() == MIRType_Int32 ||
               value->type() == MIRType_Boolean ||
@@ -516,32 +513,9 @@ StoreTypedArrayPolicy::adjustValueInput(MInstruction *ins, int arrayType,
         break;
     }
 
-    if (value != curValue) {
-        ins->replaceOperand(valueOperand, value);
-        curValue = value;
-    }
+    if (value != store->value())
+        ins->replaceOperand(2, value);
     return true;
-}
-
-bool
-StoreTypedArrayPolicy::adjustInputs(MInstruction *ins)
-{
-    MStoreTypedArrayElement *store = ins->toStoreTypedArrayElement();
-    JS_ASSERT(store->elements()->type() == MIRType_Elements);
-    JS_ASSERT(store->index()->type() == MIRType_Int32);
-
-    return adjustValueInput(ins, store->arrayType(), store->value(), 2);
-}
-
-bool
-StoreTypedArrayHolePolicy::adjustInputs(MInstruction *ins)
-{
-    MStoreTypedArrayElementHole *store = ins->toStoreTypedArrayElementHole();
-    JS_ASSERT(store->elements()->type() == MIRType_Elements);
-    JS_ASSERT(store->index()->type() == MIRType_Int32);
-    JS_ASSERT(store->length()->type() == MIRType_Int32);
-
-    return adjustValueInput(ins, store->arrayType(), store->value(), 3);
 }
 
 bool

@@ -213,15 +213,7 @@ enum MaybeCheckAliasing { CHECK_ALIASING = true, DONT_CHECK_ALIASING = false };
 
 /*****************************************************************************/
 
-#ifdef DEBUG
-extern void
-CheckLocalUnaliased(MaybeCheckAliasing checkAliasing, JSScript *script,
-                    StaticBlockObject *maybeBlock, unsigned i);
-#endif
-
-namespace ion {
-    class BaselineFrame;
-}
+class BaselineFrame;
 
 /* Pointer to either a StackFrame or a baseline JIT frame. */
 class AbstractFramePtr
@@ -240,7 +232,7 @@ class AbstractFramePtr
         JS_ASSERT((uintptr_t(fp) & 1) == 0);
     }
 
-    AbstractFramePtr(ion::BaselineFrame *fp)
+    AbstractFramePtr(BaselineFrame *fp)
       : ptr_(uintptr_t(fp))
     {
         JS_ASSERT((uintptr_t(fp) & 1) == 0);
@@ -254,18 +246,10 @@ class AbstractFramePtr
     bool isStackFrame() const {
         return ptr_ & 0x1;
     }
+
     StackFrame *asStackFrame() const {
         JS_ASSERT(isStackFrame());
         StackFrame *res = (StackFrame *)(ptr_ & ~0x1);
-        JS_ASSERT(res);
-        return res;
-    }
-    bool isBaselineFrame() const {
-        return ptr_ && !isStackFrame();
-    }
-    ion::BaselineFrame *asBaselineFrame() const {
-        JS_ASSERT(isBaselineFrame());
-        ion::BaselineFrame *res = (ion::BaselineFrame *)ptr_;
         JS_ASSERT(res);
         return res;
     }
@@ -279,9 +263,8 @@ class AbstractFramePtr
 
     inline JSGenerator *maybeSuspendedGenerator(JSRuntime *rt) const;
 
-    inline RawObject scopeChain() const;
+    inline UnrootedObject scopeChain() const;
     inline CallObject &callObj() const;
-    inline bool initFunctionScopeObjects(JSContext *cx);
     inline JSCompartment *compartment() const;
 
     inline StaticBlockObject *maybeBlockChain() const;
@@ -294,10 +277,10 @@ class AbstractFramePtr
     inline bool isFramePushedByExecute() const;
     inline bool isDebuggerFrame() const;
 
-    inline RawScript script() const;
+    inline UnrootedScript script() const;
     inline JSFunction *fun() const;
     inline JSFunction *maybeFun() const;
-    inline JSFunction *callee() const;
+    inline JSFunction &callee() const;
     inline Value calleev() const;
     inline Value &thisValue() const;
 
@@ -314,7 +297,6 @@ class AbstractFramePtr
     inline bool hasArgsObj() const;
     inline ArgumentsObject &argsObj() const;
     inline void initArgsObj(ArgumentsObject &argsobj) const;
-    inline bool useNewType() const;
 
     inline bool copyRawFrameSlots(AutoValueVector *vec) const;
 
@@ -325,8 +307,7 @@ class AbstractFramePtr
 
     inline bool prevUpToDate() const;
     inline void setPrevUpToDate() const;
-
-    JSObject *evalPrevScopeChain(JSRuntime *rt) const;
+    inline AbstractFramePtr evalPrev() const;
 
     inline void *maybeHookData() const;
     inline void setHookData(void *data) const;
@@ -408,13 +389,10 @@ class StackFrame
         HAS_PUSHED_SPS_FRAME = 0x100000,  /* SPS was notified of enty */
 
         /* Ion frame state */
-        RUNNING_IN_ION     =   0x200000,  /* frame is running in Ion */
-        CALLING_INTO_ION   =   0x400000,  /* frame is calling into Ion */
+        RUNNING_IN_ION       = 0x200000,  /* frame is running in Ion */
+        CALLING_INTO_ION     = 0x400000,  /* frame is calling into Ion */
 
-        JIT_REVISED_STACK  =   0x800000,  /* sp was revised by JIT for lowered apply */
-
-        /* Miscellaneous state. */
-        USE_NEW_TYPE       =  0x1000000   /* Use new type for constructed |this| object. */
+        JIT_REVISED_STACK    = 0x800000   /* sp was revised by JIT for lowered apply */
     };
 
   private:
@@ -438,10 +416,6 @@ class StackFrame
     void                *hookData_;     /* if HAS_HOOK_DATA, closure returned by call hook */
     FrameRejoinState    rejoin_;        /* for a jit frame rejoining the interpreter
                                          * from JIT code, state at rejoin. */
-#ifdef JS_ION
-    ion::BaselineFrame  *prevBaselineFrame_; /* for an eval/debugger frame, the baseline frame
-                                              * to use as prev. */
-#endif
 
     static void staticAsserts() {
         JS_STATIC_ASSERT(offsetof(StackFrame, rval_) % sizeof(Value) == 0);
@@ -487,13 +461,13 @@ class StackFrame
 
     /* Used for Invoke, Interpret, trace-jit LeaveTree, and method-jit stubs. */
     void initCallFrame(JSContext *cx, JSFunction &callee,
-                       RawScript script, uint32_t nactual, StackFrame::Flags flags);
+                       UnrootedScript script, uint32_t nactual, StackFrame::Flags flags);
 
     /* Used for getFixupFrame (for FixupArity). */
     void initFixupFrame(StackFrame *prev, StackFrame::Flags flags, void *ncode, unsigned nactual);
 
     /* Used for eval. */
-    void initExecuteFrame(RawScript script, StackFrame *prevLink, AbstractFramePtr prev,
+    void initExecuteFrame(UnrootedScript script, StackFrame *prevLink, AbstractFramePtr prev,
                           FrameRegs *regs, const Value &thisv, JSObject &scopeChain,
                           ExecuteType type);
 
@@ -515,9 +489,12 @@ class StackFrame
      * over-recursed) after pushing the stack frame but before 'prologue' is
      * called or completes fully. To simplify usage, 'epilogue' does not assume
      * 'prologue' has completed and handles all the intermediate state details.
+     *
+     * The 'newType' option indicates whether the constructed 'this' value (if
+     * there is one) should be given a new singleton type.
      */
 
-    bool prologue(JSContext *cx);
+    bool prologue(JSContext *cx, bool newType);
     void epilogue(JSContext *cx);
 
     /* Subsets of 'prologue' called from jit code. */
@@ -605,19 +582,6 @@ class StackFrame
     StackFrame *prev() const {
         return prev_;
     }
-
-#ifdef JS_ION
-    /*
-     * To handle eval-in-frame with a baseline JIT frame, |prev_| points to the
-     * entry frame and prevBaselineFrame_ to the actual BaselineFrame. This is
-     * done so that StackIter can skip JIT frames pushed on top of the baseline
-     * frame (these frames should not appear in stack traces).
-     */
-    ion::BaselineFrame *prevBaselineFrame() const {
-        JS_ASSERT(isEvalFrame());
-        return prevBaselineFrame_;
-    }
-#endif
 
     inline void resetGeneratorPrev(JSContext *cx);
 
@@ -762,11 +726,11 @@ class StackFrame
      *   the same VMFrame. Other calls force expansion of the inlined frames.
      */
 
-    RawScript script() const {
+    UnrootedScript script() const {
         return isFunctionFrame()
                ? isEvalFrame()
                  ? u.evalScript
-                 : fun()->nonLazyScript()
+                 : (RawScript)fun()->nonLazyScript()
                : exec.script;
     }
 
@@ -1083,22 +1047,9 @@ class StackFrame
         return flags_ & HAS_CALL_OBJ;
     }
 
-    bool hasCallObjUnchecked() const {
-        return flags_ & HAS_CALL_OBJ;
-    }
-
     bool hasArgsObj() const {
         JS_ASSERT(script()->needsArgsObj());
         return flags_ & HAS_ARGS_OBJ;
-    }
-
-    void setUseNewType() {
-        JS_ASSERT(isConstructing());
-        flags_ |= USE_NEW_TYPE;
-    }
-    bool useNewType() const {
-        JS_ASSERT(isConstructing());
-        return flags_ & USE_NEW_TYPE;
     }
 
     /*
@@ -1344,7 +1295,7 @@ class FrameRegs
     }
 
     /* For stubs::CompileFunction, ContextStack: */
-    void prepareToRun(StackFrame &fp, RawScript script) {
+    void prepareToRun(StackFrame &fp, UnrootedScript script) {
         pc = script->code;
         sp = fp.slots() + script->nfixed;
         fp_ = &fp;
@@ -1352,7 +1303,7 @@ class FrameRegs
     }
 
     void setToEndOfScript() {
-        RawScript script = fp()->script();
+        UnrootedScript script = fp()->script();
         sp = fp()->base();
         pc = script->code + script->length - JSOP_STOP_LENGTH;
         JS_ASSERT(*pc == JSOP_STOP);
@@ -1772,8 +1723,8 @@ class ContextStack
         DONT_ALLOW_CROSS_COMPARTMENT = false,
         ALLOW_CROSS_COMPARTMENT = true
     };
-    inline RawScript currentScript(jsbytecode **pc = NULL,
-                                   MaybeAllowCrossCompartment = DONT_ALLOW_CROSS_COMPARTMENT) const;
+    inline UnrootedScript currentScript(jsbytecode **pc = NULL,
+                                        MaybeAllowCrossCompartment = DONT_ALLOW_CROSS_COMPARTMENT) const;
 
     /* Get the scope chain for the topmost scripted call on the stack. */
     inline HandleObject currentScriptedScopeChain() const;
@@ -1933,9 +1884,7 @@ class StackIter
     void popFrame();
     void popCall();
 #ifdef JS_ION
-    void nextIonFrame();
     void popIonFrame();
-    void popBaselineDebuggerFrame();
 #endif
     void settleOnNewSegment();
     void settleOnNewState();
@@ -1967,15 +1916,13 @@ class StackIter
 #endif
         return data_.state_ == SCRIPTED;
     }
-    RawScript script() const {
+    UnrootedScript script() const {
         JS_ASSERT(isScript());
         if (data_.state_ == SCRIPTED)
             return interpFrame()->script();
 #ifdef JS_ION
         JS_ASSERT(data_.state_ == ION);
-        if (data_.ionFrames_.isOptimizedJS())
-            return ionInlineFrames_.script();
-        return data_.ionFrames_.script();
+        return ionInlineFrames_.script();
 #else
         return NULL;
 #endif
@@ -1984,23 +1931,6 @@ class StackIter
         JS_ASSERT(!done());
         return data_.state_ == ION;
     }
-
-    bool isIonOptimizedJS() const {
-#ifdef JS_ION
-        return isIon() && data_.ionFrames_.isOptimizedJS();
-#else
-        return false;
-#endif
-    }
-
-    bool isIonBaselineJS() const {
-#ifdef JS_ION
-        return isIon() && data_.ionFrames_.isBaselineJS();
-#else
-        return false;
-#endif
-    }
-
     bool isNativeCall() const {
         JS_ASSERT(!done());
 #ifdef JS_ION
@@ -2118,13 +2048,6 @@ class AllFramesIter
     AllFramesIter& operator++();
 
     bool isIon() const { return state_ == ION; }
-    bool isIonOptimizedJS() const {
-#ifdef JS_ION
-        return isIon() && ionFrames_.isOptimizedJS();
-#else
-        return false;
-#endif
-    }
     StackFrame *interpFrame() const { JS_ASSERT(state_ == SCRIPTED); return fp_; }
     StackSegment *seg() const { return seg_; }
 

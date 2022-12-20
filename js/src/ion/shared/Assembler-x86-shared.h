@@ -28,8 +28,8 @@ class AssemblerX86Shared
         { }
     };
 
-    Vector<CodeLabel, 0, SystemAllocPolicy> codeLabels_;
-    Vector<RelativePatch, 8, SystemAllocPolicy> jumps_;
+    js::Vector<CodeLabel, 0, SystemAllocPolicy> codeLabels_;
+    js::Vector<RelativePatch, 8, SystemAllocPolicy> jumps_;
     CompactBufferWriter jumpRelocations_;
     CompactBufferWriter dataRelocations_;
     CompactBufferWriter preBarriers_;
@@ -67,7 +67,6 @@ class AssemblerX86Shared
         LessThanOrEqual = JSC::X86Assembler::ConditionLE,
         Overflow = JSC::X86Assembler::ConditionO,
         Signed = JSC::X86Assembler::ConditionS,
-        NotSigned = JSC::X86Assembler::ConditionNS,
         Zero = JSC::X86Assembler::ConditionE,
         NonZero = JSC::X86Assembler::ConditionNE,
         Parity = JSC::X86Assembler::ConditionP,
@@ -166,16 +165,13 @@ class AssemblerX86Shared
     }
 
     void executableCopy(void *buffer);
-    void processCodeLabels(uint8_t *rawCode);
+    void processCodeLabels(IonCode *code);
     void copyJumpRelocationTable(uint8_t *dest);
     void copyDataRelocationTable(uint8_t *dest);
     void copyPreBarrierTable(uint8_t *dest);
 
     bool addCodeLabel(CodeLabel label) {
         return codeLabels_.append(label);
-    }
-    size_t numCodeLabels() const {
-        return codeLabels_.length();
     }
 
     // Size of the instruction stream, in bytes.
@@ -210,10 +206,6 @@ class AssemblerX86Shared
         // instruction stream.
         masm.jumpTablePointer(label->prev());
         label->setPrev(masm.size());
-    }
-    void writeDoubleConstant(double d, Label *label) {
-        label->bind(masm.size());
-        masm.doubleConstant(d);
     }
     void movl(const Imm32 &imm32, const Register &dest) {
         masm.movl_i32r(imm32.value, dest.code());
@@ -461,18 +453,6 @@ class AssemblerX86Shared
             JS_NOT_REACHED("unexpected operand kind");
         }
     }
-    void leal(const Operand &src, const Register &dest) {
-        switch (src.kind()) {
-          case Operand::REG_DISP:
-            masm.leal_mr(src.disp(), src.base(), dest.code());
-            break;
-          case Operand::SCALE:
-            masm.leal_mr(src.disp(), src.base(), src.index(), src.scale(), dest.code());
-            break;
-          default:
-            JS_NOT_REACHED("unexpected operand kind");
-        }
-    }
 
   protected:
     JmpSrc jSrc(Condition cond, Label *label) {
@@ -607,7 +587,8 @@ class AssemblerX86Shared
         label->reset();
     }
 
-    static void Bind(uint8_t *raw, AbsoluteLabel *label, const void *address) {
+    static void Bind(IonCode *code, AbsoluteLabel *label, const void *address) {
+        uint8_t *raw = code->raw();
         if (label->used()) {
             intptr_t src = label->offset();
             do {
@@ -851,9 +832,6 @@ class AssemblerX86Shared
             JS_NOT_REACHED("unexpected operand kind");
         }
     }
-    void andl(const Register &src, const Register &dest) {
-        masm.andl_rr(src.code(), dest.code());
-    }
     void andl(Imm32 imm, const Register &dest) {
         masm.andl_ir(imm.value, dest.code());
     }
@@ -962,9 +940,7 @@ class AssemblerX86Shared
             JS_NOT_REACHED("unexpected operand kind");
         }
     }
-    void notl(const Register &reg) {
-        masm.notl_r(reg.code());
-    }
+
     void shrl(const Imm32 imm, const Register &dest) {
         masm.shrl_i8r(imm.value, dest.code());
     }
@@ -1020,13 +996,6 @@ class AssemblerX86Shared
         masm.pop_r(src.code());
     }
 
-    void pushFlags() {
-        masm.push_flags();
-    }
-    void popFlags() {
-        masm.pop_flags();
-    }
-
 #ifdef JS_CPU_X86
     void pushAllRegs() {
         masm.pusha();
@@ -1044,11 +1013,8 @@ class AssemblerX86Shared
     void cdq() {
         masm.cdq();
     }
-    void idiv(Register divisor) {
-        masm.idivl_r(divisor.code());
-    }
-    void udiv(Register divisor) {
-        masm.divl_r(divisor.code());
+    void idiv(Register dest) {
+        masm.idivl_r(dest.code());
     }
 
     void unpcklps(const FloatRegister &src, const FloatRegister &dest) {

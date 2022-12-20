@@ -10,9 +10,8 @@
 
 #include <stdio.h>
 
+#include "gc/Root.h"
 #include "jsscript.h"
-
-#include "js/RootingAPI.h"
 
 class JSScript;
 
@@ -61,7 +60,7 @@ class JSONSpewer
     ~JSONSpewer();
 
     bool init(const char *path);
-    void beginFunction(RawScript script);
+    void beginFunction(UnrootedScript script);
     void beginPass(const char * pass);
     void spewMDef(MDefinition *def);
     void spewMResumePoint(MResumePoint *rp);

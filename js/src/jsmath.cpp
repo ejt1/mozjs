@@ -11,7 +11,6 @@
 
 #include "mozilla/Constants.h"
 #include "mozilla/FloatingPoint.h"
-#include "mozilla/MathAlgorithms.h"
 
 #include <stdlib.h>
 #include "jstypes.h"
@@ -30,8 +29,6 @@
 #include "jsobjinlines.h"
 
 using namespace js;
-
-using mozilla::Abs;
 
 #ifndef M_E
 #define M_E             2.7182818284590452354
@@ -105,23 +102,38 @@ js_math_abs(JSContext *cx, unsigned argc, Value *vp)
     }
     if (!ToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    z = Abs(x);
+    z = fabs(x);
     vp->setNumber(z);
     return JS_TRUE;
 }
 
-double
-js::math_acos_impl(MathCache *cache, double x)
+static JSBool
+math_acos(JSContext *cx, unsigned argc, Value *vp)
 {
+    double x, z;
+
+    if (argc == 0) {
+        vp->setDouble(js_NaN);
+        return JS_TRUE;
+    }
+    if (!ToNumber(cx, vp[2], &x))
+        return JS_FALSE;
 #if defined(SOLARIS) && defined(__GNUC__)
-    if (x < -1 || 1 < x)
-        return js_NaN;
+    if (x < -1 || 1 < x) {
+        vp->setDouble(js_NaN);
+        return JS_TRUE;
+    }
 #endif
-    return cache->lookup(acos, x);
+    MathCache *mathCache = cx->runtime->getMathCache(cx);
+    if (!mathCache)
+        return JS_FALSE;
+    z = mathCache->lookup(acos, x);
+    vp->setDouble(z);
+    return JS_TRUE;
 }
 
-JSBool
-js::math_acos(JSContext *cx, unsigned argc, Value *vp)
+static JSBool
+math_asin(JSContext *cx, unsigned argc, Value *vp)
 {
     double x, z;
 
@@ -131,26 +143,22 @@ js::math_acos(JSContext *cx, unsigned argc, Value *vp)
     }
     if (!ToNumber(cx, vp[2], &x))
         return JS_FALSE;
-    MathCache *mathCache = cx->runtime->getMathCache(cx);
-    if (!mathCache)
-        return JS_FALSE;
-    z = math_acos_impl(mathCache, x);
-    vp->setDouble(z);
-    return JS_TRUE;
-}
-
-double
-js::math_asin_impl(MathCache *cache, double x)
-{
 #if defined(SOLARIS) && defined(__GNUC__)
-    if (x < -1 || 1 < x)
-        return js_NaN;
+    if (x < -1 || 1 < x) {
+        vp->setDouble(js_NaN);
+        return JS_TRUE;
+    }
 #endif
-    return cache->lookup(asin, x);
+    MathCache *mathCache = cx->runtime->getMathCache(cx);
+    if (!mathCache)
+        return JS_FALSE;
+    z = mathCache->lookup(asin, x);
+    vp->setDouble(z);
+    return JS_TRUE;
 }
 
-JSBool
-js::math_asin(JSContext *cx, unsigned argc, Value *vp)
+static JSBool
+math_atan(JSContext *cx, unsigned argc, Value *vp)
 {
     double x, z;
 
@@ -163,38 +171,13 @@ js::math_asin(JSContext *cx, unsigned argc, Value *vp)
     MathCache *mathCache = cx->runtime->getMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
-    z = math_asin_impl(mathCache, x);
+    z = mathCache->lookup(atan, x);
     vp->setDouble(z);
     return JS_TRUE;
 }
 
-double
-js::math_atan_impl(MathCache *cache, double x)
-{
-    return cache->lookup(atan, x);
-}
-
-JSBool
-js::math_atan(JSContext *cx, unsigned argc, Value *vp)
-{
-    double x, z;
-
-    if (argc == 0) {
-        vp->setDouble(js_NaN);
-        return JS_TRUE;
-    }
-    if (!ToNumber(cx, vp[2], &x))
-        return JS_FALSE;
-    MathCache *mathCache = cx->runtime->getMathCache(cx);
-    if (!mathCache)
-        return JS_FALSE;
-    z = math_atan_impl(mathCache, x);
-    vp->setDouble(z);
-    return JS_TRUE;
-}
-
-double
-js::ecmaAtan2(double x, double y)
+static inline double JS_FASTCALL
+math_atan2_kernel(double x, double y)
 {
 #if defined(_MSC_VER)
     /*
@@ -223,8 +206,8 @@ js::ecmaAtan2(double x, double y)
     return atan2(x, y);
 }
 
-JSBool
-js::math_atan2(JSContext *cx, unsigned argc, Value *vp)
+static JSBool
+math_atan2(JSContext *cx, unsigned argc, Value *vp)
 {
     double x, y, z;
 
@@ -234,7 +217,7 @@ js::math_atan2(JSContext *cx, unsigned argc, Value *vp)
     }
     if (!ToNumber(cx, vp[2], &x) || !ToNumber(cx, vp[3], &y))
         return JS_FALSE;
-    z = ecmaAtan2(x, y);
+    z = math_atan2_kernel(x, y);
     vp->setDouble(z);
     return JS_TRUE;
 }
@@ -290,22 +273,22 @@ js::math_cos(JSContext *cx, unsigned argc, Value *vp)
     return JS_TRUE;
 }
 
-double
-js::math_exp_impl(MathCache *cache, double x)
+static double
+math_exp_body(double d)
 {
 #ifdef _WIN32
-    if (!MOZ_DOUBLE_IS_NaN(x)) {
-        if (x == js_PositiveInfinity)
+    if (!MOZ_DOUBLE_IS_NaN(d)) {
+        if (d == js_PositiveInfinity)
             return js_PositiveInfinity;
-        if (x == js_NegativeInfinity)
+        if (d == js_NegativeInfinity)
             return 0.0;
     }
 #endif
-    return cache->lookup(exp, x);
+    return exp(d);
 }
 
-JSBool
-js::math_exp(JSContext *cx, unsigned argc, Value *vp)
+static JSBool
+math_exp(JSContext *cx, unsigned argc, Value *vp)
 {
     double x, z;
 
@@ -318,7 +301,7 @@ js::math_exp(JSContext *cx, unsigned argc, Value *vp)
     MathCache *mathCache = cx->runtime->getMathCache(cx);
     if (!mathCache)
         return JS_FALSE;
-    z = math_exp_impl(mathCache, x);
+    z = mathCache->lookup(math_exp_body, x);
     vp->setNumber(z);
     return JS_TRUE;
 }
@@ -476,9 +459,6 @@ js::ecmaPow(double x, double y)
      */
     if (!MOZ_DOUBLE_IS_FINITE(y) && (x == 1.0 || x == -1.0))
         return js_NaN;
-    /* pow(x, +-0) is always 1, even for x = NaN (MSVC gets this wrong). */
-    if (y == 0)
-        return 1;
     return pow(x, y);
 }
 #if defined(_MSC_VER)

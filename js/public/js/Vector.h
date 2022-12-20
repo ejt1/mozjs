@@ -1,5 +1,5 @@
 /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=4 sw=4 et tw=99 ft=cpp:
+ * vim: set ts=8 sw=4 et tw=99 ft=cpp:
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -297,7 +297,7 @@ class Vector : private AllocPolicy
 #endif
 
     /* Append operations guaranteed to succeed due to pre-reserved space. */
-    template <class U> void internalAppend(U u);
+    template <class U> void internalAppend(U t);
     void internalAppendN(const T &t, size_t n);
     template <class U> void internalAppend(const U *begin, size_t length);
     template <class U, size_t O, class BP> void internalAppend(const Vector<U,O,BP> &other);
@@ -395,11 +395,8 @@ class Vector : private AllocPolicy
 
     /* mutators */
 
-    /* Given that the Vector is empty and has no inline storage, grow to |capacity|. */
-    bool initCapacity(size_t request);
-
     /* If reserve(length() + N) succeeds, the N next appends are guaranteed to succeed. */
-    bool reserve(size_t request);
+    bool reserve(size_t capacity);
 
     /*
      * Destroy elements in the range [end() - incr, end()). Does not deallocate
@@ -444,8 +441,8 @@ class Vector : private AllocPolicy
      * Guaranteed-infallible append operations for use upon vectors whose
      * memory has been pre-reserved.
      */
-    template <class U> void infallibleAppend(const U &u) {
-        internalAppend(u);
+    void infallibleAppend(const T &t) {
+        internalAppend(t);
     }
     void infallibleAppendN(const T &t, size_t n) {
         internalAppendN(t, n);
@@ -482,19 +479,10 @@ class Vector : private AllocPolicy
     void replaceRawBuffer(T *p, size_t length);
 
     /*
-     * Places |val| at position |p|, shifting existing elements from |p|
-     * onward one position higher.  On success, |p| should not be reused
-     * because it will be a dangling pointer if reallocation of the vector
-     * storage occurred;  the return value should be used instead.  On failure,
-     * NULL is returned.
-     *
-     * Example usage:
-     *
-     *   if (!(p = vec.insert(p, val)))
-     *       <handle failure>
-     *   <keep working with p>
+     * Places |val| at position |p|, shifting existing elements
+     * from |p| onward one position higher.
      */
-    T *insert(T *p, const T &val);
+    bool insert(T *p, const T &val);
 
     /*
      * Removes the element |t|, which must fall in the bounds [begin, end),
@@ -532,7 +520,7 @@ Vector<T,N,AllocPolicy>::Vector(AllocPolicy ap)
   : AllocPolicy(ap), mBegin((T *)storage.addr()), mLength(0),
     mCapacity(sInlineCapacity)
 #ifdef DEBUG
-  , mReserved(sInlineCapacity), entered(false)
+  , mReserved(0), entered(false)
 #endif
 {}
 
@@ -569,7 +557,7 @@ Vector<T, N, AllocPolicy>::Vector(MoveRef<Vector> rhs)
         rhs->mCapacity = sInlineCapacity;
         rhs->mLength = 0;
 #ifdef DEBUG
-        rhs->mReserved = sInlineCapacity;
+        rhs->mReserved = 0;
 #endif
     }
 }
@@ -704,25 +692,6 @@ Vector<T,N,AP>::growStorageBy(size_t incr)
 
 template <class T, size_t N, class AP>
 inline bool
-Vector<T,N,AP>::initCapacity(size_t request)
-{
-    JS_ASSERT(empty());
-    JS_ASSERT(usingInlineStorage());
-    if (request == 0)
-        return true;
-    T *newbuf = reinterpret_cast<T *>(this->malloc_(request * sizeof(T)));
-    if (!newbuf)
-        return false;
-    mBegin = newbuf;
-    mCapacity = request;
-#ifdef DEBUG
-    mReserved = request;
-#endif
-    return true;
-}
-
-template <class T, size_t N, class AP>
-inline bool
 Vector<T,N,AP>::reserve(size_t request)
 {
     REENTRANCY_GUARD_ET_AL;
@@ -828,7 +797,7 @@ Vector<T,N,AP>::clearAndFree()
     mBegin = (T *)storage.addr();
     mCapacity = sInlineCapacity;
 #ifdef DEBUG
-    mReserved = sInlineCapacity;
+    mReserved = 0;
 #endif
 }
 
@@ -859,11 +828,11 @@ Vector<T,N,AP>::append(U t)
 template <class T, size_t N, class AP>
 template <class U>
 JS_ALWAYS_INLINE void
-Vector<T,N,AP>::internalAppend(U u)
+Vector<T,N,AP>::internalAppend(U t)
 {
     JS_ASSERT(mLength + 1 <= mReserved);
     JS_ASSERT(mReserved <= mCapacity);
-    new(endNoCheck()) T(u);
+    new(endNoCheck()) T(t);
     ++mLength;
 }
 
@@ -894,25 +863,24 @@ Vector<T,N,AP>::internalAppendN(const T &t, size_t needed)
 }
 
 template <class T, size_t N, class AP>
-inline T *
+inline bool
 Vector<T,N,AP>::insert(T *p, const T &val)
 {
     JS_ASSERT(begin() <= p && p <= end());
     size_t pos = p - begin();
     JS_ASSERT(pos <= mLength);
     size_t oldLength = mLength;
-    if (pos == oldLength) {
-        if (!append(val))
-            return NULL;
-    } else {
+    if (pos == oldLength)
+        return append(val);
+    {
         T oldBack = back();
         if (!append(oldBack)) /* Dup the last element. */
-            return NULL;
-        for (size_t i = oldLength; i > pos; --i)
-            (*this)[i] = (*this)[i - 1];
-        (*this)[pos] = val;
+            return false;
     }
-    return begin() + pos;
+    for (size_t i = oldLength; i > pos; --i)
+        (*this)[i] = (*this)[i - 1];
+    (*this)[pos] = val;
+    return true;
 }
 
 template<typename T, size_t N, class AP>
@@ -1018,7 +986,7 @@ Vector<T,N,AP>::extractRawBuffer()
         mLength = 0;
         mCapacity = sInlineCapacity;
 #ifdef DEBUG
-        mReserved = sInlineCapacity;
+        mReserved = 0;
 #endif
     }
     return ret;

@@ -58,7 +58,7 @@ CheckStackRoot(JSRuntime *rt, uintptr_t *w, Rooter *begin, Rooter *end)
         return;
 
     /* Don't check atoms as these will never be subject to generational collection. */
-    if (static_cast<Cell *>(thing)->tenuredZone() == rt->atomsCompartment->zone())
+    if (IsAtomsCompartment(reinterpret_cast<Cell *>(thing)->compartment()))
         return;
 
     /*
@@ -93,7 +93,7 @@ CheckStackRoot(JSRuntime *rt, uintptr_t *w, Rooter *begin, Rooter *end)
      * overwrite a now-dead GC thing pointer. In this case we want to avoid
      * damaging the smaller value.
      */
-    JS::PoisonPtr(w);
+    PoisonPtr(w);
 }
 
 static void
@@ -217,11 +217,19 @@ JS::CheckStackRoots(JSContext *cx)
     if (rt->gcZeal_ != ZealStackRootingValue)
         return;
 
+    // If this assertion fails, it means that an AutoAssertNoGC was placed
+    // around code that could trigger GC, and is therefore wrong. The
+    // AutoAssertNoGC should be removed and the code it was guarding should be
+    // modified to properly root any gcthings, and very possibly any code
+    // calling that function should also be modified if it was improperly
+    // assuming that GC could not happen at all within the called function.
+    // (The latter may not apply if the AutoAssertNoGC only protected a portion
+    // of a function, so the callers were already assuming that GC could
+    // happen.)
+    JS_ASSERT(!InNoGCScope());
+
     // GCs can't happen when analysis/inference/compilation are active.
     if (cx->compartment->activeAnalysis)
-        return;
-
-    if (rt->mainThread.suppressGC)
         return;
 
     // Can switch to the atoms compartment during analysis.
@@ -310,30 +318,6 @@ JS::CheckStackRoots(JSContext *cx)
 #endif /* DEBUG && JS_GC_ZEAL && JSGC_ROOT_ANALYSIS && !JS_THREADSAFE */
 
 #ifdef JS_GC_ZEAL
-
-static void
-DisableGGCForVerification(JSRuntime *rt)
-{
-#ifdef JSGC_GENERATIONAL
-    if (rt->gcVerifyPreData || rt->gcVerifyPostData)
-        return;
-
-    if (rt->gcStoreBuffer.isEnabled())
-        rt->gcStoreBuffer.disable();
-#endif
-}
-
-static void
-EnableGGCAfterVerification(JSRuntime *rt)
-{
-#ifdef JSGC_GENERATIONAL
-    if (rt->gcVerifyPreData || rt->gcVerifyPostData)
-        return;
-
-    if (rt->gcGenerationalEnabled)
-        rt->gcStoreBuffer.enable();
-#endif
-}
 
 /*
  * Write barrier verification
@@ -477,8 +461,6 @@ gc::StartVerifyPreBarriers(JSRuntime *rt)
         return;
     }
 
-    DisableGGCForVerification(rt);
-
     AutoPrepareForTracing prep(rt);
 
     for (GCChunkSet::Range r(rt->gcChunkSet.all()); !r.empty(); r.popFront())
@@ -533,9 +515,10 @@ gc::StartVerifyPreBarriers(JSRuntime *rt)
     rt->gcVerifyPreData = trc;
     rt->gcIncrementalState = MARK;
     rt->gcMarker.start();
+    for (CompartmentsIter c(rt); !c.done(); c.next())
+        PurgeJITCaches(c);
 
     for (ZonesIter zone(rt); !zone.done(); zone.next()) {
-        PurgeJITCaches(zone);
         zone->setNeedsBarrier(true, Zone::UpdateIon);
         zone->allocator.arenas.purge();
     }
@@ -544,9 +527,8 @@ gc::StartVerifyPreBarriers(JSRuntime *rt)
 
 oom:
     rt->gcIncrementalState = NO_INCREMENTAL;
-    js_delete(trc);
-    rt->gcVerifyPreData = NULL;
-    EnableGGCAfterVerification(rt);
+    trc->~VerifyPreTracer();
+    js_free(trc);
 }
 
 static bool
@@ -615,8 +597,10 @@ gc::EndVerifyPreBarriers(JSRuntime *rt)
             compartmentCreated = true;
 
         zone->setNeedsBarrier(false, Zone::UpdateIon);
-        PurgeJITCaches(zone);
     }
+
+    for (CompartmentsIter c(rt); !c.done(); c.next())
+        PurgeJITCaches(c);
 
     /*
      * We need to bump gcNumber so that the methodjit knows that jitcode has
@@ -649,9 +633,8 @@ gc::EndVerifyPreBarriers(JSRuntime *rt)
     rt->gcMarker.reset();
     rt->gcMarker.stop();
 
-    js_delete(trc);
-
-    EnableGGCAfterVerification(rt);
+    trc->~VerifyPreTracer();
+    js_free(trc);
 }
 
 /*** Post-Barrier Verifyier ***/
@@ -678,26 +661,23 @@ gc::StartVerifyPostBarriers(JSRuntime *rt)
     {
         return;
     }
-
-    DisableGGCForVerification(rt);
-
     VerifyPostTracer *trc = js_new<VerifyPostTracer>();
     rt->gcVerifyPostData = trc;
     rt->gcNumber++;
     trc->number = rt->gcNumber;
     trc->count = 0;
 
-    if (!rt->gcVerifierNursery.enable())
+    if (!rt->gcNursery.clear())
         goto oom;
 
-    if (!rt->gcStoreBuffer.enable())
+    if (!rt->gcStoreBuffer.clear())
         goto oom;
 
     return;
 oom:
-    js_delete(trc);
+    trc->~VerifyPostTracer();
+    js_free(trc);
     rt->gcVerifyPostData = NULL;
-    EnableGGCAfterVerification(rt);
 #endif
 }
 
@@ -723,7 +703,7 @@ PostVerifierVisitEdge(JSTracer *jstrc, void **thingp, JSGCTraceKind kind)
     JSRuntime *rt = dst->runtime();
 
     /* Filter out non cross-generational edges. */
-    if (!rt->gcVerifierNursery.isInside(dst))
+    if (!rt->gcNursery.isInside(dst))
         return;
 
     /*
@@ -754,27 +734,29 @@ js::gc::EndVerifyPostBarriers(JSRuntime *rt)
         goto oom;
 
     /* Walk the heap. */
-    for (CompartmentsIter comp(rt); !comp.done(); comp.next()) {
-        if (comp->watchpointMap)
-            comp->watchpointMap->markAll(trc);
-    }
-    for (GCZoneGroupIter zone(rt); !zone.done(); zone.next()) {
+    for (CompartmentsIter c(rt); !c.done(); c.next()) {
+        if (IsAtomsCompartment(c))
+            continue;
+
+        if (c->watchpointMap)
+            c->watchpointMap->markAll(trc);
+
         for (size_t kind = 0; kind < FINALIZE_LIMIT; ++kind) {
-            for (CellIterUnderGC cells(zone, AllocKind(kind)); !cells.done(); cells.next()) {
+            for (CellIterUnderGC cells(c, AllocKind(kind)); !cells.done(); cells.next()) {
                 Cell *src = cells.getCell();
-                if (!rt->gcVerifierNursery.isInside(src))
+                if (!rt->gcNursery.isInside(src))
                     JS_TraceChildren(trc, src, MapAllocToTraceKind(AllocKind(kind)));
             }
         }
     }
 
 oom:
-    js_delete(trc);
+    trc->~VerifyPostTracer();
+    js_free(trc);
     rt->gcVerifyPostData = NULL;
-    rt->gcVerifierNursery.disable();
+    rt->gcNursery.disable();
     rt->gcStoreBuffer.disable();
     rt->gcStoreBuffer.releaseVerificationData();
-    EnableGGCAfterVerification(rt);
 #endif
 }
 
@@ -854,19 +836,17 @@ void
 js::gc::FinishVerifier(JSRuntime *rt)
 {
     if (VerifyPreTracer *trc = (VerifyPreTracer *)rt->gcVerifyPreData) {
-        js_delete(trc);
-        rt->gcVerifyPreData = NULL;
+        trc->~VerifyPreTracer();
+        js_free(trc);
     }
 #ifdef JSGC_GENERATIONAL
     if (VerifyPostTracer *trc = (VerifyPostTracer *)rt->gcVerifyPostData) {
-        js_delete(trc);
-        rt->gcVerifierNursery.disable();
+        trc->~VerifyPostTracer();
+        js_free(trc);
+        rt->gcNursery.disable();
         rt->gcStoreBuffer.disable();
-        rt->gcStoreBuffer.releaseVerificationData();
-        rt->gcVerifyPostData = NULL;
     }
 #endif
-    EnableGGCAfterVerification(rt);
 }
 
 #endif /* JS_GC_ZEAL */

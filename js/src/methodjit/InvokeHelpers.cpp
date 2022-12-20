@@ -134,8 +134,7 @@ static inline bool
 MaybeCloneAndPatchCallee(JSContext *cx, CallArgs args, HandleScript script, jsbytecode *pc)
 {
     if (cx->typeInferenceEnabled() && !args.calleev().isPrimitive() &&
-        args.callee().isFunction() && args.callee().toFunction()->hasScript() &&
-        args.callee().toFunction()->nonLazyScript()->shouldCloneAtCallsite)
+        args.callee().isFunction() && args.callee().toFunction()->isCloneAtCallsite())
     {
         RootedFunction fun(cx, args.callee().toFunction());
         fun = CloneFunctionAtCallsite(cx, fun, script, pc);
@@ -212,6 +211,7 @@ stubs::HitStackQuota(VMFrame &f)
 void * JS_FASTCALL
 stubs::FixupArity(VMFrame &f, uint32_t nactual)
 {
+    AssertCanGC();
     JSContext *cx = f.cx;
     StackFrame *oldfp = f.fp();
 
@@ -232,8 +232,8 @@ stubs::FixupArity(VMFrame &f, uint32_t nactual)
 
     /* Reserve enough space for a callee frame. */
     CallArgs args = CallArgsFromSp(nactual, f.regs.sp);
-    if (script->isCallsiteClone) {
-        JS_ASSERT(args.callee().toFunction() == script->originalFunction());
+    if (fun->isCallsiteClone()) {
+        JS_ASSERT(args.callee().toFunction() == fun->getExtendedSlot(0).toObject().toFunction());
         args.setCallee(ObjectValue(*fun));
     }
     StackFrame *fp = cx->stack.getFixupFrame(cx, DONT_REPORT_ERROR, args, fun,
@@ -308,6 +308,7 @@ static inline bool
 UncachedInlineCall(VMFrame &f, InitialFrameFlags initial,
                    void **pret, bool *unjittable, uint32_t argc)
 {
+    AssertCanGC();
     JSContext *cx = f.cx;
     CallArgs args = CallArgsFromSp(argc, f.regs.sp);
     RootedFunction newfun(cx, args.callee().toFunction());
@@ -343,7 +344,7 @@ UncachedInlineCall(VMFrame &f, InitialFrameFlags initial,
      * jitcode discarding / frame expansion.
      */
     if (f.regs.inlined() && newfun->isHeavyweight()) {
-        ExpandInlineFrames(cx->zone());
+        ExpandInlineFrames(cx->compartment);
         JS_ASSERT(!f.regs.inlined());
     }
 
@@ -386,7 +387,7 @@ UncachedInlineCall(VMFrame &f, InitialFrameFlags initial,
      * triggered while interpreting.
      */
     if (f.regs.inlined()) {
-        ExpandInlineFrames(cx->zone());
+        ExpandInlineFrames(cx->compartment);
         JS_ASSERT(!f.regs.inlined());
         regs.fp()->resetInlinePrev(f.fp(), f.regs.pc);
     }
@@ -540,7 +541,7 @@ js_InternalThrow(VMFrame &f)
 {
     JSContext *cx = f.cx;
 
-    ExpandInlineFrames(cx->zone());
+    ExpandInlineFrames(cx->compartment);
 
     // The current frame may have an associated orphaned native, if the native
     // or SplatApplyArgs threw an exception.
@@ -694,6 +695,7 @@ stubs::CreateThis(VMFrame &f, JSObject *proto)
 void JS_FASTCALL
 stubs::ScriptDebugPrologue(VMFrame &f)
 {
+    AssertCanGC();
     Probes::enterScript(f.cx, f.script(), f.script()->function(), f.fp());
     JSTrapStatus status = js::ScriptDebugPrologue(f.cx, f.fp());
     switch (status) {
@@ -720,21 +722,24 @@ stubs::ScriptDebugEpilogue(VMFrame &f)
 void JS_FASTCALL
 stubs::ScriptProbeOnlyPrologue(VMFrame &f)
 {
+    AutoAssertNoGC nogc;
     Probes::enterScript(f.cx, f.script(), f.script()->function(), f.fp());
 }
 
 void JS_FASTCALL
 stubs::ScriptProbeOnlyEpilogue(VMFrame &f)
 {
+    AutoAssertNoGC nogc;
     Probes::exitScript(f.cx, f.script(), f.script()->function(), f.fp());
 }
 
 void JS_FASTCALL
 stubs::CrossChunkShim(VMFrame &f, void *edge_)
 {
+    AssertCanGC();
     DebugOnly<CrossChunkEdge*> edge = (CrossChunkEdge *) edge_;
 
-    mjit::ExpandInlineFrames(f.cx->zone());
+    mjit::ExpandInlineFrames(f.cx->compartment);
 
     RootedScript script(f.cx, f.script());
     JS_ASSERT(edge->target < script->length);
@@ -813,7 +818,7 @@ js_InternalInterpret(void *returnData, void *returnType, void *returnReg, js::VM
 
 #ifdef JS_METHODJIT_SPEW
     JaegerSpew(JSpew_Recompile, "interpreter rejoin (file \"%s\") (line \"%d\") (op %s) (opline \"%d\")\n",
-               script->filename(), script->lineno, OpcodeNames[op], PCToLineNumber(script, pc));
+               script->filename, script->lineno, OpcodeNames[op], PCToLineNumber(script, pc));
 #endif
 
     uint32_t nextDepth = UINT32_MAX;
@@ -934,9 +939,7 @@ js_InternalInterpret(void *returnData, void *returnType, void *returnReg, js::VM
             return js_InternalThrow(f);
         fp->initVarsToUndefined();
         fp->scopeChain();
-        if (types::UseNewTypeAtEntry(cx, fp))
-            fp->setUseNewType();
-        if (!fp->prologue(cx))
+        if (!fp->prologue(cx, types::UseNewTypeAtEntry(cx, fp)))
             return js_InternalThrow(f);
 
         /*

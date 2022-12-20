@@ -29,11 +29,11 @@ class CheckOverRecursedFailure;
 class ParCheckOverRecursedFailure;
 class OutOfLineParCheckInterrupt;
 class OutOfLineUnboxDouble;
+class OutOfLineCache;
 class OutOfLineStoreElementHole;
 class OutOfLineTypeOfV;
 class OutOfLineLoadTypedArray;
 class OutOfLineParNewGCThing;
-class OutOfLineUpdateCache;
 
 class CodeGenerator : public CodeGeneratorSpecific
 {
@@ -41,11 +41,10 @@ class CodeGenerator : public CodeGeneratorSpecific
     bool generateBody();
 
   public:
-    CodeGenerator(MIRGenerator *gen, LIRGraph *graph, MacroAssembler *masm = NULL);
+    CodeGenerator(MIRGenerator *gen, LIRGraph *graph);
 
   public:
     bool generate();
-    bool generateAsmJS();
     bool link();
 
     bool visitLabel(LLabel *lir);
@@ -70,8 +69,6 @@ class CodeGenerator : public CodeGeneratorSpecific
     void emitOOLTestObject(Register objreg, Label *ifTruthy, Label *ifFalsy, Register scratch);
     bool visitTestOAndBranch(LTestOAndBranch *lir);
     bool visitTestVAndBranch(LTestVAndBranch *lir);
-    bool visitFunctionDispatch(LFunctionDispatch *lir);
-    bool visitTypeObjectDispatch(LTypeObjectDispatch *lir);
     bool visitPolyInlineDispatch(LPolyInlineDispatch *lir);
     bool visitIntToString(LIntToString *lir);
     bool visitInteger(LInteger *lir);
@@ -96,13 +93,8 @@ class CodeGenerator : public CodeGeneratorSpecific
     void emitPushArguments(LApplyArgsGeneric *apply, Register extraStackSpace);
     void emitPopArguments(LApplyArgsGeneric *apply, Register extraStackSize);
     bool visitApplyArgsGeneric(LApplyArgsGeneric *apply);
-    bool visitGetDynamicName(LGetDynamicName *lir);
-    bool visitFilterArguments(LFilterArguments *lir);
-    bool visitCallDirectEval(LCallDirectEval *lir);
     bool visitDoubleToInt32(LDoubleToInt32 *lir);
     bool visitNewSlots(LNewSlots *lir);
-    bool visitNewParallelArrayVMCall(LNewParallelArray *lir);
-    bool visitNewParallelArray(LNewParallelArray *lir);
     bool visitOutOfLineNewParallelArray(OutOfLineNewParallelArray *ool);
     bool visitNewArrayCallVM(LNewArray *lir);
     bool visitNewArray(LNewArray *lir);
@@ -140,7 +132,6 @@ class CodeGenerator : public CodeGeneratorSpecific
     bool visitAbsI(LAbsI *lir);
     bool visitPowI(LPowI *lir);
     bool visitPowD(LPowD *lir);
-    bool visitNegI(LNegI *lir);
     bool visitNegD(LNegD *lir);
     bool visitRandom(LRandom *lir);
     bool visitMathFunctionD(LMathFunctionD *ins);
@@ -189,7 +180,6 @@ class CodeGenerator : public CodeGeneratorSpecific
     bool visitLoadTypedArrayElement(LLoadTypedArrayElement *lir);
     bool visitLoadTypedArrayElementHole(LLoadTypedArrayElementHole *lir);
     bool visitStoreTypedArrayElement(LStoreTypedArrayElement *lir);
-    bool visitStoreTypedArrayElementHole(LStoreTypedArrayElementHole *lir);
     bool visitClampIToUint8(LClampIToUint8 *lir);
     bool visitClampDToUint8(LClampDToUint8 *lir);
     bool visitClampVToUint8(LClampVToUint8 *lir);
@@ -216,14 +206,9 @@ class CodeGenerator : public CodeGeneratorSpecific
     bool visitSetDOMProperty(LSetDOMProperty *lir);
     bool visitCallDOMNative(LCallDOMNative *lir);
     bool visitCallGetIntrinsicValue(LCallGetIntrinsicValue *lir);
-    bool visitAsmJSCall(LAsmJSCall *lir);
-    bool visitAsmJSParameter(LAsmJSParameter *lir);
-    bool visitAsmJSReturn(LAsmJSReturn *ret);
-    bool visitAsmJSVoidReturn(LAsmJSVoidReturn *ret);
 
     bool visitCheckOverRecursed(LCheckOverRecursed *lir);
     bool visitCheckOverRecursedFailure(CheckOverRecursedFailure *ool);
-    bool visitAsmJSCheckOverRecursed(LAsmJSCheckOverRecursed *lir);
 
     bool visitParCheckOverRecursed(LParCheckOverRecursed *lir);
     bool visitParCheckOverRecursedFailure(ParCheckOverRecursedFailure *ool);
@@ -235,32 +220,49 @@ class CodeGenerator : public CodeGeneratorSpecific
     bool visitOutOfLineUnboxDouble(OutOfLineUnboxDouble *ool);
     bool visitOutOfLineStoreElementHole(OutOfLineStoreElementHole *ool);
 
+    bool visitOutOfLineCacheGetProperty(OutOfLineCache *ool);
+    bool visitOutOfLineGetElementCache(OutOfLineCache *ool);
+    bool visitOutOfLineSetPropertyCache(OutOfLineCache *ool);
+    bool visitOutOfLineBindNameCache(OutOfLineCache *ool);
+    bool visitOutOfLineGetNameCache(OutOfLineCache *ool);
+    bool visitOutOfLineCallsiteCloneCache(OutOfLineCache *ool);
+
     bool visitOutOfLineParNewGCThing(OutOfLineParNewGCThing *ool);
+
     bool visitOutOfLineParallelAbort(OutOfLineParallelAbort *ool);
 
-    // Inline caches visitors.
-    bool visitOutOfLineCache(OutOfLineUpdateCache *ool);
-
-    bool visitGetPropertyCacheV(LGetPropertyCacheV *ins);
-    bool visitGetPropertyCacheT(LGetPropertyCacheT *ins);
-    bool visitGetElementCacheV(LGetElementCacheV *ins);
-    bool visitGetElementCacheT(LGetElementCacheT *ins);
-    bool visitBindNameCache(LBindNameCache *ins);
-    bool visitCallSetProperty(LInstruction *ins);
-    bool visitSetPropertyCacheV(LSetPropertyCacheV *ins);
-    bool visitSetPropertyCacheT(LSetPropertyCacheT *ins);
-    bool visitGetNameCache(LGetNameCache *ins);
-    bool visitCallsiteCloneCache(LCallsiteCloneCache *ins);
-
-    bool visitGetPropertyIC(OutOfLineUpdateCache *ool, GetPropertyIC *ic);
-    bool visitSetPropertyIC(OutOfLineUpdateCache *ool, SetPropertyIC *ic);
-    bool visitGetElementIC(OutOfLineUpdateCache *ool, GetElementIC *ic);
-    bool visitBindNameIC(OutOfLineUpdateCache *ool, BindNameIC *ic);
-    bool visitNameIC(OutOfLineUpdateCache *ool, NameIC *ic);
-    bool visitCallsiteCloneIC(OutOfLineUpdateCache *ool, CallsiteCloneIC *ic);
+    bool visitGetPropertyCacheV(LGetPropertyCacheV *ins) {
+        return visitCache(ins);
+    }
+    bool visitGetPropertyCacheT(LGetPropertyCacheT *ins) {
+        return visitCache(ins);
+    }
+    bool visitGetElementCacheV(LGetElementCacheV *ins) {
+        return visitCache(ins);
+    }
+    bool visitBindNameCache(LBindNameCache *ins) {
+        return visitCache(ins);
+    }
+    bool visitSetPropertyCacheV(LSetPropertyCacheV *ins) {
+        return visitCache(ins);
+    }
+    bool visitSetPropertyCacheT(LSetPropertyCacheT *ins) {
+        return visitCache(ins);
+    }
+    bool visitGetNameCache(LGetNameCache *ins) {
+        return visitCache(ins);
+    }
+    bool visitCallsiteCloneCache(LCallsiteCloneCache *ins) {
+        return visitCache(ins);
+    }
 
   private:
+    bool visitCache(LInstruction *load);
+    bool visitCallSetProperty(LInstruction *ins);
+
     bool checkForParallelBailout();
+
+    ConstantOrRegister getSetPropertyValue(LInstruction *ins);
     bool generateBranchV(const ValueOperand &value, Label *ifTrue, Label *ifFalse, FloatRegister fr);
 
     bool emitParAllocateGCThing(const Register &objReg,

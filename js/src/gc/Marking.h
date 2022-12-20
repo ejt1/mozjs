@@ -98,7 +98,6 @@ DeclMarker(Object, GlobalObject)
 DeclMarker(Object, JSObject)
 DeclMarker(Object, JSFunction)
 DeclMarker(Object, ScopeObject)
-DeclMarker(Object, ArrayBufferObject)
 DeclMarker(Script, JSScript)
 DeclMarker(Shape, Shape)
 DeclMarker(String, JSAtom)
@@ -109,13 +108,6 @@ DeclMarker(String, PropertyName)
 DeclMarker(TypeObject, types::TypeObject)
 
 #undef DeclMarker
-
-/* Return true if the pointer is NULL, or if it is a tagged pointer to NULL. */
-JS_ALWAYS_INLINE bool
-IsNullTaggedPointer(void *p)
-{
-    return uintptr_t(p) < 32;
-}
 
 /*** Externally Typed Marking ***/
 
@@ -244,7 +236,7 @@ MarkChildren(JSTracer *trc, JSObject *obj);
  * JS_TraceShapeCycleCollectorChildren.
  */
 void
-MarkCycleCollectorChildren(JSTracer *trc, RawShape shape);
+MarkCycleCollectorChildren(JSTracer *trc, UnrootedShape shape);
 
 void
 PushArena(GCMarker *gcmarker, ArenaHeader *aheader);
@@ -385,6 +377,9 @@ TraceKind(JSScript *script)
 
 void
 TraceChildren(JSTracer *trc, void *thing, JSGCTraceKind kind);
+
+void
+CallTracer(JSTracer *trc, void *thing, JSGCTraceKind kind);
 
 } /* namespace js */
 

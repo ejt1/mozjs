@@ -73,7 +73,7 @@ Recompiler::patchCall(JITChunk *chunk, StackFrame *fp, void **location)
 }
 
 void
-Recompiler::patchNative(JSRuntime *rt, JITChunk *chunk, StackFrame *fp,
+Recompiler::patchNative(JSCompartment *compartment, JITChunk *chunk, StackFrame *fp,
                         jsbytecode *pc, RejoinState rejoin)
 {
     /*
@@ -91,7 +91,7 @@ Recompiler::patchNative(JSRuntime *rt, JITChunk *chunk, StackFrame *fp,
     fp->setRejoin(StubRejoin(rejoin));
 
     /* :XXX: We might crash later if this fails. */
-    rt->jaegerRuntime().orphanedNativeFrames.append(fp);
+    compartment->rt->jaegerRuntime().orphanedNativeFrames.append(fp);
 
     DebugOnly<bool> found = false;
 
@@ -128,7 +128,7 @@ Recompiler::patchNative(JSRuntime *rt, JITChunk *chunk, StackFrame *fp,
         }
 
         /* :XXX: We leak the pool if this fails. Oh well. */
-        rt->jaegerRuntime().orphanedNativePools.append(stub.pool);
+        compartment->rt->jaegerRuntime().orphanedNativePools.append(stub.pool);
 
         /* Mark as stolen in case there are multiple calls on the stack. */
         stub.pool = NULL;
@@ -138,8 +138,10 @@ Recompiler::patchNative(JSRuntime *rt, JITChunk *chunk, StackFrame *fp,
 }
 
 void
-Recompiler::patchFrame(JSRuntime *rt, VMFrame *f, JSScript *script)
+Recompiler::patchFrame(JSCompartment *compartment, VMFrame *f, JSScript *script)
 {
+    AutoAssertNoGC nogc;
+
     /*
      * Check if the VMFrame returns directly into the script's jitcode. This
      * depends on the invariant that f->fp() reflects the frame at the point
@@ -154,7 +156,7 @@ Recompiler::patchFrame(JSRuntime *rt, VMFrame *f, JSScript *script)
         rejoin == REJOIN_NATIVE_GETTER) {
         /* Native call. */
         if (fp->script() == script) {
-            patchNative(rt, fp->jit()->chunk(f->regs.pc), fp, f->regs.pc, rejoin);
+            patchNative(compartment, fp->jit()->chunk(f->regs.pc), fp, f->regs.pc, rejoin);
             f->stubRejoin = REJOIN_NATIVE_PATCHED;
         }
     } else if (rejoin == REJOIN_NATIVE_PATCHED) {
@@ -183,6 +185,8 @@ Recompiler::patchFrame(JSRuntime *rt, VMFrame *f, JSScript *script)
 StackFrame *
 Recompiler::expandInlineFrameChain(StackFrame *outer, InlineFrame *inner)
 {
+    AutoAssertNoGC nogc;
+
     StackFrame *parent;
     if (inner->parent)
         parent = expandInlineFrameChain(outer, inner->parent);
@@ -223,18 +227,18 @@ JITCodeReturnAddress(void *data)
  * to refer to the new innermost frame.
  */
 void
-Recompiler::expandInlineFrames(Zone *zone,
+Recompiler::expandInlineFrames(JSCompartment *compartment,
                                StackFrame *fp, mjit::CallSite *inlined,
                                StackFrame *next, VMFrame *f)
 {
+    AutoAssertNoGC nogc;
     JS_ASSERT_IF(next, next->prev() == fp && next->prevInline() == inlined);
 
     /*
      * Treat any frame expansion as a recompilation event, so that f.jit() is
      * stable if no recompilations have occurred.
      */
-    for (CompartmentsInZoneIter comp(zone); !comp.done(); comp.next())
-        comp->types.frameExpansions++;
+    compartment->types.frameExpansions++;
 
     jsbytecode *pc = next ? next->prevpc() : f->regs.pc;
     JITChunk *chunk = fp->jit()->chunk(pc);
@@ -292,19 +296,20 @@ Recompiler::expandInlineFrames(Zone *zone,
 }
 
 void
-ExpandInlineFrames(Zone *zone)
+ExpandInlineFrames(JSCompartment *compartment)
 {
-    JSRuntime *rt = zone->rt;
-
-    if (!rt->hasJaegerRuntime())
+    if (!compartment || !compartment->rt->hasJaegerRuntime())
         return;
 
-    for (VMFrame *f = rt->jaegerRuntime().activeFrame(); f != NULL; f = f->previous) {
-        if (f->entryfp->compartment()->zone() != zone)
+    for (VMFrame *f = compartment->rt->jaegerRuntime().activeFrame();
+         f != NULL;
+         f = f->previous) {
+
+        if (f->entryfp->compartment() != compartment)
             continue;
 
         if (f->regs.inlined())
-            mjit::Recompiler::expandInlineFrames(zone, f->fp(), f->regs.inlined(), NULL, f);
+            mjit::Recompiler::expandInlineFrames(compartment, f->fp(), f->regs.inlined(), NULL, f);
 
         StackFrame *end = f->entryfp->prev();
         StackFrame *next = NULL;
@@ -316,7 +321,7 @@ ExpandInlineFrames(Zone *zone)
             mjit::CallSite *inlined;
             next->prevpc(&inlined);
             if (inlined) {
-                mjit::Recompiler::expandInlineFrames(zone, fp, inlined, next, f);
+                mjit::Recompiler::expandInlineFrames(compartment, fp, inlined, next, f);
                 fp = next;
                 next = NULL;
             } else {
@@ -330,26 +335,24 @@ ExpandInlineFrames(Zone *zone)
 }
 
 void
-ClearAllFrames(Zone *zone)
+ClearAllFrames(JSCompartment *compartment)
 {
-    JSRuntime *rt = zone->rt;
-
-    if (!rt->hasJaegerRuntime())
+    AutoAssertNoGC nogc;
+    if (!compartment || !compartment->rt->hasJaegerRuntime())
         return;
 
-    ExpandInlineFrames(zone);
+    ExpandInlineFrames(compartment);
 
-    for (CompartmentsInZoneIter comp(zone); !comp.done(); comp.next())
-        comp->types.recompilations++;
+    compartment->types.recompilations++;
 
-    for (VMFrame *f = rt->jaegerRuntime().activeFrame();
+    for (VMFrame *f = compartment->rt->jaegerRuntime().activeFrame();
          f != NULL;
          f = f->previous)
     {
-        if (f->entryfp->compartment()->zone() != zone)
+        if (f->entryfp->compartment() != compartment)
             continue;
 
-        Recompiler::patchFrame(rt, f, f->fp()->script());
+        Recompiler::patchFrame(compartment, f, f->fp()->script());
 
         // Clear ncode values from all frames associated with the VMFrame.
         // Patching the VMFrame's return address will cause all its frames to
@@ -364,11 +367,11 @@ ClearAllFrames(Zone *zone)
     }
 
     // Purge all ICs in chunks for which we patched any native frames, see patchNative.
-    for (VMFrame *f = rt->jaegerRuntime().activeFrame();
+    for (VMFrame *f = compartment->rt->jaegerRuntime().activeFrame();
          f != NULL;
          f = f->previous)
     {
-        if (f->entryfp->compartment()->zone() != zone)
+        if (f->entryfp->compartment() != compartment)
             continue;
 
         JS_ASSERT(f->stubRejoin != REJOIN_NATIVE &&
@@ -401,10 +404,11 @@ ClearAllFrames(Zone *zone)
 void
 Recompiler::clearStackReferences(FreeOp *fop, JSScript *script)
 {
+    AutoAssertNoGC nogc;
     JS_ASSERT(script->hasMJITInfo());
 
     JaegerSpew(JSpew_Recompile, "recompiling script (file \"%s\") (line \"%d\") (length \"%d\") (usecount=\"%d\")\n",
-               script->filename(), script->lineno, script->length, (int) script->getUseCount());
+               script->filename, script->lineno, script->length, (int) script->getUseCount());
 
     JSCompartment *comp = script->compartment();
     types::AutoEnterAnalysis enter(fop, comp);
@@ -452,7 +456,7 @@ Recompiler::clearStackReferences(FreeOp *fop, JSScript *script)
             next = fp;
         }
 
-        patchFrame(comp->rt, f, script);
+        patchFrame(comp, f, script);
     }
 
     comp->types.recompilations++;

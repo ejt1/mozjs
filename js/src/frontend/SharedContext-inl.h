@@ -42,6 +42,13 @@ SharedContext::asModuleBox()
     return static_cast<ModuleBox*>(this);
 }
 
+inline FunctionBox *
+SharedContext::asFunctionBox()
+{
+    JS_ASSERT(isFunctionBox());
+    return static_cast<FunctionBox*>(this);
+}
+
 GlobalSharedContext::GlobalSharedContext(JSContext *cx, JSObject *scopeChain, bool strict)
   : SharedContext(cx, strict),
     scopeChain_(cx, scopeChain)
@@ -124,7 +131,7 @@ frontend::LexicalLookup(ContextT *ct, HandleAtom atom, int *slotp, typename Cont
             continue;
 
         StaticBlockObject &blockObj = *stmt->blockObj;
-        RawShape shape = blockObj.nativeLookup(ct->sc->context, id);
+        UnrootedShape shape = blockObj.nativeLookup(ct->sc->context, id);
         if (shape) {
             JS_ASSERT(shape->hasShortID());
 

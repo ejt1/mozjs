@@ -177,14 +177,6 @@ GetBuildConfiguration(JSContext *cx, unsigned argc, jsval *vp)
     if (!JS_SetProperty(cx, info, "methodjit", &value))
         return false;
 
-#ifdef ENABLE_PARALLEL_JS
-    value = BooleanValue(true);
-#else
-    value = BooleanValue(false);
-#endif
-    if (!JS_SetProperty(cx, info, "parallelJS", &value))
-        return false;
-
     *vp = ObjectValue(*info);
     return true;
 }
@@ -465,6 +457,31 @@ VerifyPostBarriers(JSContext *cx, unsigned argc, jsval *vp)
 }
 
 static JSBool
+GCSlice(JSContext *cx, unsigned argc, jsval *vp)
+{
+    bool limit = true;
+    uint32_t budget = 0;
+    CallArgs args = CallArgsFromVp(argc, vp);
+
+    if (argc > 1) {
+        RootedObject callee(cx, &args.callee());
+        ReportUsageError(cx, callee, "Wrong number of arguments");
+        return JS_FALSE;
+    }
+
+    if (argc == 1) {
+        if (!JS_ValueToECMAUint32(cx, args[0], &budget))
+            return false;
+    } else {
+        limit = false;
+    }
+
+    GCDebugSlice(cx->runtime, limit, budget);
+    *vp = JSVAL_VOID;
+    return JS_TRUE;
+}
+
+static JSBool
 GCState(JSContext *cx, unsigned argc, jsval *vp)
 {
     CallArgs args = CallArgsFromVp(argc, vp);
@@ -511,31 +528,6 @@ DeterministicGC(JSContext *cx, unsigned argc, jsval *vp)
 #endif /* JS_GC_ZEAL */
 
 static JSBool
-GCSlice(JSContext *cx, unsigned argc, jsval *vp)
-{
-    bool limit = true;
-    uint32_t budget = 0;
-    CallArgs args = CallArgsFromVp(argc, vp);
-
-    if (argc > 1) {
-        RootedObject callee(cx, &args.callee());
-        ReportUsageError(cx, callee, "Wrong number of arguments");
-        return JS_FALSE;
-    }
-
-    if (argc == 1) {
-        if (!JS_ValueToECMAUint32(cx, args[0], &budget))
-            return false;
-    } else {
-        limit = false;
-    }
-
-    GCDebugSlice(cx->runtime, limit, budget);
-    *vp = JSVAL_VOID;
-    return JS_TRUE;
-}
-
-static JSBool
 ValidateGC(JSContext *cx, unsigned argc, jsval *vp)
 {
     CallArgs args = CallArgsFromVp(argc, vp);
@@ -547,22 +539,6 @@ ValidateGC(JSContext *cx, unsigned argc, jsval *vp)
     }
 
     gc::SetValidateGC(cx, ToBoolean(vp[2]));
-    *vp = JSVAL_VOID;
-    return JS_TRUE;
-}
-
-static JSBool
-FullCompartmentChecks(JSContext *cx, unsigned argc, jsval *vp)
-{
-    CallArgs args = CallArgsFromVp(argc, vp);
-
-    if (argc != 1) {
-        RootedObject callee(cx, &args.callee());
-        ReportUsageError(cx, callee, "Wrong number of arguments");
-        return JS_FALSE;
-    }
-
-    gc::SetFullCompartmentChecks(cx, ToBoolean(vp[2]));
     *vp = JSVAL_VOID;
     return JS_TRUE;
 }
@@ -583,8 +559,8 @@ NondeterminsticGetWeakMapKeys(JSContext *cx, unsigned argc, jsval *vp)
                              InformalValueTypeName(args[0]));
         return false;
     }
-    RootedObject arr(cx);
-    if (!JS_NondeterministicGetWeakMapKeys(cx, &args[0].toObject(), arr.address()))
+    JSObject *arr;
+    if (!JS_NondeterministicGetWeakMapKeys(cx, &args[0].toObject(), &arr))
         return false;
     if (!arr) {
         JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_NOT_EXPECTED_TYPE,
@@ -660,6 +636,8 @@ static const struct TraceKindPair {
 static JSBool
 CountHeap(JSContext *cx, unsigned argc, jsval *vp)
 {
+    void* startThing;
+    JSGCTraceKind startTraceKind;
     jsval v;
     int32_t traceKind;
     JSString *str;
@@ -667,11 +645,13 @@ CountHeap(JSContext *cx, unsigned argc, jsval *vp)
     JSCountHeapNode *node;
     size_t counter;
 
-    Value startValue = UndefinedValue();
+    startThing = NULL;
+    startTraceKind = JSTRACE_OBJECT;
     if (argc > 0) {
         v = JS_ARGV(cx, vp)[0];
         if (JSVAL_IS_TRACEABLE(v)) {
-            startValue = v;
+            startThing = JSVAL_TO_TRACEABLE(v);
+            startTraceKind = JSVAL_TRACE_KIND(v);
         } else if (!JSVAL_IS_NULL(v)) {
             JS_ReportError(cx,
                            "the first argument is not null or a heap-allocated "
@@ -711,10 +691,11 @@ CountHeap(JSContext *cx, unsigned argc, jsval *vp)
     countTracer.traceList = NULL;
     countTracer.recycleList = NULL;
 
-    if (startValue.isUndefined()) {
+    if (!startThing) {
         JS_TraceRuntime(&countTracer.base);
     } else {
-        JS_CallValueTracer(&countTracer.base, startValue, "root");
+        JS_SET_TRACING_NAME(&countTracer.base, "root");
+        JS_CallTracer(&countTracer.base, startThing, startTraceKind);
     }
 
     counter = 0;
@@ -790,7 +771,7 @@ DumpHeapComplete(JSContext *cx, unsigned argc, jsval *vp)
         Value v = JS_ARGV(cx, vp)[0];
         if (v.isString()) {
             JSString *str = v.toString();
-            if (!fileNameBytes.encodeLatin1(cx, str))
+            if (!fileNameBytes.encode(cx, str))
                 return false;
             fileName = fileNameBytes.ptr();
         }
@@ -908,16 +889,6 @@ js::testingFunc_inParallelSection(JSContext *cx, unsigned argc, jsval *vp)
     return true;
 }
 
-#ifndef JS_ION
-JSBool
-js::IsAsmJSCompilationAvailable(JSContext *cx, unsigned argc, Value *vp)
-{
-    CallArgs args = CallArgsFromVp(argc, vp);
-    args.rval().set(BooleanValue(false));
-    return true;
-}
-#endif
-
 static JSFunctionSpecWithHelp TestingFunctions[] = {
     JS_FN_HELP("gc", ::GC, 0, 0,
 "gc([obj] | 'compartment')",
@@ -993,6 +964,10 @@ static JSFunctionSpecWithHelp TestingFunctions[] = {
 "verifypostbarriers()",
 "  Start or end a run of the post-write barrier verifier."),
 
+    JS_FN_HELP("gcslice", GCSlice, 1, 0,
+"gcslice(n)",
+"  Run an incremental GC slice that marks about n objects."),
+
     JS_FN_HELP("gcstate", GCState, 0, 0,
 "gcstate()",
 "  Report the global GC state."),
@@ -1002,17 +977,9 @@ static JSFunctionSpecWithHelp TestingFunctions[] = {
 "  If true, only allow determinstic GCs to run."),
 #endif
 
-    JS_FN_HELP("gcslice", GCSlice, 1, 0,
-"gcslice(n)",
-"  Run an incremental GC slice that marks about n objects."),
-
     JS_FN_HELP("validategc", ValidateGC, 1, 0,
 "validategc(true|false)",
 "  If true, a separate validation step is performed after an incremental GC."),
-
-    JS_FN_HELP("fullcompartmentchecks", FullCompartmentChecks, 1, 0,
-"fullcompartmentchecks(true|false)",
-"  If true, check for compartment mismatches before every GC."),
 
     JS_FN_HELP("nondeterministicGetWeakMapKeys", NondeterminsticGetWeakMapKeys, 1, 0,
 "nondeterministicGetWeakMapKeys(weakmap)",
@@ -1052,11 +1019,6 @@ static JSFunctionSpecWithHelp TestingFunctions[] = {
 "  Gets the display name for a function, which can possibly be a guessed or\n"
 "  inferred name based on where the function was defined. This can be\n"
 "  different from the 'name' property on the function."),
-
-    JS_FN_HELP("isAsmJSCompilationAvailable", IsAsmJSCompilationAvailable, 0, 0,
-"isAsmJSCompilationAvailable",
-"  Returns whether asm.js compilation is currently available or whether it is disabled\n"
-"  (e.g., by the debugger)."),
 
     JS_FN_HELP("inParallelSection", testingFunc_inParallelSection, 0, 0,
 "inParallelSection()",

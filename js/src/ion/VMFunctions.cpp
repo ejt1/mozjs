@@ -8,17 +8,12 @@
 #include "Ion.h"
 #include "IonCompartment.h"
 #include "jsinterp.h"
-#include "ion/BaselineFrame-inl.h"
-#include "ion/BaselineIC.h"
 #include "ion/IonFrames.h"
 #include "ion/IonFrames-inl.h" // for GetTopIonJSScript
 
 #include "vm/StringObject-inl.h"
-#include "vm/Debugger.h"
 
 #include "builtin/ParallelArray.h"
-
-#include "frontend/TokenStream.h"
 
 #include "jsboolinlines.h"
 #include "jsinterpinlines.h"
@@ -56,13 +51,15 @@ ShouldMonitorReturnType(JSFunction *fun)
 bool
 InvokeFunction(JSContext *cx, HandleFunction fun0, uint32_t argc, Value *argv, Value *rval)
 {
+    AssertCanGC();
+
     RootedFunction fun(cx, fun0);
     if (fun->isInterpreted()) {
         if (fun->isInterpretedLazy() && !fun->getOrCreateScript(cx))
             return false;
 
         // Clone function at call site if needed.
-        if (fun->nonLazyScript()->shouldCloneAtCallsite) {
+        if (fun->isCloneAtCallsite()) {
             RootedScript script(cx);
             jsbytecode *pc;
             types::TypeScript::GetPcScript(cx, script.address(), &pc);
@@ -74,7 +71,7 @@ InvokeFunction(JSContext *cx, HandleFunction fun0, uint32_t argc, Value *argv, V
         // In order to prevent massive bouncing between Ion and JM, see if we keep
         // hitting functions that are uncompilable.
         if (cx->methodJitEnabled && !fun->nonLazyScript()->canIonCompile()) {
-            RawScript script = GetTopIonJSScript(cx);
+            UnrootedScript script = GetTopIonJSScript(cx);
             if (script->hasIonScript() &&
                 ++script->ion->slowCallCount >= js_IonOptions.slowCallLimit)
             {
@@ -156,17 +153,6 @@ DefVarOrConst(JSContext *cx, HandlePropertyName dn, unsigned attrs, HandleObject
         obj = obj->enclosingScope();
 
     return DefVarOrConstOperation(cx, obj, dn, attrs);
-}
-
-bool
-SetConst(JSContext *cx, HandlePropertyName name, HandleObject scopeChain, HandleValue rval)
-{
-    // Given the ScopeChain, extract the VarObj.
-    RootedObject obj(cx, scopeChain);
-    while (!obj->isVarObj())
-        obj = obj->enclosingScope();
-
-    return SetConstOperation(cx, obj, name, rval);
 }
 
 bool
@@ -266,6 +252,7 @@ template bool StringsEqual<false>(JSContext *cx, HandleString lhs, HandleString 
 JSBool
 ObjectEmulatesUndefined(RawObject obj)
 {
+    AutoAssertNoGC nogc;
     return EmulatesUndefined(obj);
 }
 
@@ -278,21 +265,6 @@ IteratorMore(JSContext *cx, HandleObject obj, JSBool *res)
 
     *res = tmp.toBoolean();
     return true;
-}
-
-JSObject *
-NewInitParallelArray(JSContext *cx, HandleObject templateObject)
-{
-    JS_ASSERT(templateObject->getClass() == &ParallelArrayObject::class_);
-    JS_ASSERT(!templateObject->hasSingletonType());
-
-    RootedObject obj(cx, ParallelArrayObject::newInstance(cx));
-    if (!obj)
-        return NULL;
-
-    obj->setType(templateObject->type());
-
-    return obj;
 }
 
 JSObject*
@@ -510,6 +482,13 @@ OperatorIn(JSContext *cx, HandleValue key, HandleObject obj, JSBool *out)
 }
 
 bool
+OperatorInI(JSContext *cx, uint32_t index, HandleObject obj, JSBool *out)
+{
+    RootedValue key(cx, Int32Value(index));
+    return OperatorIn(cx, key, obj, out);
+}
+
+bool
 GetIntrinsicValue(JSContext *cx, HandlePropertyName name, MutableHandleValue rval)
 {
     return cx->global()->getIntrinsicValue(cx, name, rval);
@@ -531,250 +510,6 @@ CreateThis(JSContext *cx, HandleObject callee, MutableHandleValue rval)
     }
 
     return true;
-}
-
-void
-GetDynamicName(JSContext *cx, JSObject *scopeChain, JSString *str, Value *vp)
-{
-    // Lookup a string on the scope chain, returning either the value found or
-    // undefined through rval. This function is infallible, and cannot GC or
-    // invalidate.
-
-    JSAtom *atom;
-    if (str->isAtom()) {
-        atom = &str->asAtom();
-    } else {
-        atom = AtomizeString<NoGC>(cx, str);
-        if (!atom) {
-            vp->setUndefined();
-            return;
-        }
-    }
-
-    if (!frontend::IsIdentifier(atom) || frontend::FindKeyword(atom->chars(), atom->length())) {
-        vp->setUndefined();
-        return;
-    }
-
-    Shape *shape = NULL;
-    JSObject *scope = NULL, *pobj = NULL;
-    if (LookupNameNoGC(cx, atom->asPropertyName(), scopeChain, &scope, &pobj, &shape)) {
-        if (FetchNameNoGC(pobj, shape, MutableHandleValue::fromMarkedLocation(vp)))
-            return;
-    }
-
-    vp->setUndefined();
-}
-
-JSBool
-FilterArguments(JSContext *cx, JSString *str)
-{
-    // getChars() is fallible, but cannot GC: it can only allocate a character
-    // for the flattened string. If this call fails then the calling Ion code
-    // will bailout, resume in the interpreter and likely fail again when
-    // trying to flatten the string and unwind the stack.
-    const jschar *chars = str->getChars(cx);
-    if (!chars)
-        return false;
-
-    static jschar arguments[] = {'a', 'r', 'g', 'u', 'm', 'e', 'n', 't', 's'};
-    return !StringHasPattern(chars, str->length(), arguments, mozilla::ArrayLength(arguments));
-}
-
-uint32_t
-GetIndexFromString(JSString *str)
-{
-    // Masks the return value UINT32_MAX as failure to get the index.
-    // I.e. it is impossible to distinguish between failing to get the index
-    // or the actual index UINT32_MAX.
-
-    if (!str->isAtom())
-        return UINT32_MAX;
-
-    uint32_t index;
-    JSAtom *atom = &str->asAtom();
-    if (!atom->isIndex(&index))
-        return UINT32_MAX;
-
-    return index;
-}
-
-bool
-DebugPrologue(JSContext *cx, BaselineFrame *frame, JSBool *mustReturn)
-{
-    *mustReturn = false;
-
-    JSTrapStatus status = ScriptDebugPrologue(cx, frame);
-    switch (status) {
-      case JSTRAP_CONTINUE:
-        return true;
-
-      case JSTRAP_RETURN:
-        // The script is going to return immediately, so we have to call the
-        // debug epilogue handler as well.
-        JS_ASSERT(frame->hasReturnValue());
-        *mustReturn = true;
-        return ion::DebugEpilogue(cx, frame, true);
-
-      case JSTRAP_THROW:
-      case JSTRAP_ERROR:
-        return false;
-
-      default:
-        JS_NOT_REACHED("Invalid trap status");
-    }
-}
-
-bool
-DebugEpilogue(JSContext *cx, BaselineFrame *frame, JSBool ok)
-{
-    // Unwind scope chain to stack depth 0.
-    UnwindScope(cx, frame, 0);
-
-    // If ScriptDebugEpilogue returns |true| we have to return the frame's
-    // return value. If it returns |false|, the debugger threw an exception.
-    // In both cases we have to pop debug scopes.
-    ok = ScriptDebugEpilogue(cx, frame, ok);
-
-    if (frame->isNonEvalFunctionFrame()) {
-        JS_ASSERT_IF(ok, frame->hasReturnValue());
-        DebugScopes::onPopCall(frame, cx);
-    }
-
-    if (!ok) {
-        // Pop this frame by updating ionTop, so that the exception handling
-        // code will start at the previous frame.
-        IonJSFrameLayout *prefix = frame->framePrefix();
-        EnsureExitFrame(prefix);
-        cx->mainThread().ionTop = (uint8_t *)prefix;
-    }
-
-    return ok;
-}
-
-bool
-StrictEvalPrologue(JSContext *cx, BaselineFrame *frame)
-{
-    return frame->strictEvalPrologue(cx);
-}
-
-bool
-HeavyweightFunPrologue(JSContext *cx, BaselineFrame *frame)
-{
-    return frame->heavyweightFunPrologue(cx);
-}
-
-bool
-NewArgumentsObject(JSContext *cx, BaselineFrame *frame, MutableHandleValue res)
-{
-    ArgumentsObject *obj = ArgumentsObject::createExpected(cx, frame);
-    if (!obj)
-        return false;
-    res.setObject(*obj);
-    return true;
-}
-
-bool
-HandleDebugTrap(JSContext *cx, BaselineFrame *frame, uint8_t *retAddr, JSBool *mustReturn)
-{
-    *mustReturn = false;
-
-    RootedScript script(cx, GetTopIonJSScript(cx));
-    jsbytecode *pc = script->baseline->icEntryFromReturnAddress(retAddr).pc(script);
-
-    JS_ASSERT(cx->compartment->debugMode());
-    JS_ASSERT(script->stepModeEnabled() || script->hasBreakpointsAt(pc));
-
-    RootedValue rval(cx);
-    JSTrapStatus status = JSTRAP_CONTINUE;
-    JSInterruptHook hook = cx->runtime->debugHooks.interruptHook;
-
-    if (hook || script->stepModeEnabled()) {
-        if (hook)
-            status = hook(cx, script, pc, rval.address(), cx->runtime->debugHooks.interruptHookData);
-        if (status == JSTRAP_CONTINUE && script->stepModeEnabled())
-            status = Debugger::onSingleStep(cx, &rval);
-    }
-
-    if (status == JSTRAP_CONTINUE && script->hasBreakpointsAt(pc))
-        status = Debugger::onTrap(cx, &rval);
-
-    switch (status) {
-      case JSTRAP_CONTINUE:
-        break;
-
-      case JSTRAP_ERROR:
-        return false;
-
-      case JSTRAP_RETURN:
-        *mustReturn = true;
-        frame->setReturnValue(rval);
-        return ion::DebugEpilogue(cx, frame, true);
-
-      case JSTRAP_THROW:
-        cx->setPendingException(rval);
-        return false;
-
-      default:
-        JS_NOT_REACHED("Invalid trap status");
-    }
-
-    return true;
-}
-
-bool
-OnDebuggerStatement(JSContext *cx, BaselineFrame *frame, jsbytecode *pc, JSBool *mustReturn)
-{
-    *mustReturn = false;
-
-    RootedScript script(cx, frame->script());
-    JSTrapStatus status = JSTRAP_CONTINUE;
-    RootedValue rval(cx);
-
-    if (JSDebuggerHandler handler = cx->runtime->debugHooks.debuggerHandler)
-        status = handler(cx, script, pc, rval.address(), cx->runtime->debugHooks.debuggerHandlerData);
-
-    if (status == JSTRAP_CONTINUE)
-        status = Debugger::onDebuggerStatement(cx, &rval);
-
-    switch (status) {
-      case JSTRAP_ERROR:
-        return false;
-
-      case JSTRAP_CONTINUE:
-        return true;
-
-      case JSTRAP_RETURN:
-        frame->setReturnValue(rval);
-        *mustReturn = true;
-        return ion::DebugEpilogue(cx, frame, true);
-
-      case JSTRAP_THROW:
-        cx->setPendingException(rval);
-        return false;
-
-      default:
-        JS_NOT_REACHED("Invalid trap status");
-    }
-}
-
-bool
-EnterBlock(JSContext *cx, BaselineFrame *frame, Handle<StaticBlockObject *> block)
-{
-    return frame->pushBlock(cx, block);
-}
-
-bool
-LeaveBlock(JSContext *cx, BaselineFrame *frame)
-{
-    frame->popBlock(cx);
-    return true;
-}
-
-bool
-InitBaselineFrameForOsr(BaselineFrame *frame, StackFrame *interpFrame, uint32_t numStackValues)
-{
-    return frame->initForOsr(interpFrame, numStackValues);
 }
 
 } // namespace ion

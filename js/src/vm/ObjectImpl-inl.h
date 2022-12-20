@@ -13,7 +13,6 @@
 #include "jscompartment.h"
 #include "jsgc.h"
 #include "jsinterp.h"
-#include "jsproxy.h"
 
 #include "gc/Heap.h"
 #include "gc/Marking.h"
@@ -41,25 +40,13 @@ Debug_SetSlotRangeToCrashOnTouch(HeapSlot *begin, HeapSlot *end)
 
 } // namespace js
 
-inline JSCompartment *
-js::ObjectImpl::compartment() const
-{
-    return lastProperty()->base()->compartment();
-}
-
-inline js::TaggedProto
-js::ObjectImpl::getTaggedProto() const
-{
-    return TaggedProto(getProto());
-}
-
-inline js::RawShape
+inline js::UnrootedShape
 js::ObjectImpl::nativeLookup(JSContext *cx, PropertyId pid)
 {
     return nativeLookup(cx, pid.asId());
 }
 
-inline js::RawShape
+inline js::UnrootedShape
 js::ObjectImpl::nativeLookup(JSContext *cx, PropertyName *name)
 {
     return nativeLookup(cx, NameToId(name));
@@ -86,10 +73,6 @@ js::ObjectImpl::nativeContains(JSContext *cx, Shape *shape)
 inline bool
 js::ObjectImpl::isExtensible() const
 {
-    if (this->isProxy())
-        return Proxy::isExtensible(const_cast<JSObject*>(this->asObjectPtr()));
-
-    // [[Extensible]] for ordinary non-proxy objects is an object flag.
     return !lastProperty()->hasObjectFlag(BaseShape::NOT_EXTENSIBLE);
 }
 
@@ -98,13 +81,6 @@ js::ObjectImpl::getDenseInitializedLength()
 {
     MOZ_ASSERT(isNative());
     return getElementsHeader()->initializedLength;
-}
-
-inline uint32_t
-js::ObjectImpl::getDenseCapacity()
-{
-    MOZ_ASSERT(isNative());
-    return getElementsHeader()->capacity;
 }
 
 inline js::HeapSlotArray
@@ -229,7 +205,7 @@ inline void
 js::ObjectImpl::setSlot(uint32_t slot, const js::Value &value)
 {
     MOZ_ASSERT(slotInRange(slot));
-    MOZ_ASSERT(IsObjectValueInCompartment(value, asObjectPtr()->compartment()));
+    MOZ_ASSERT(IsObjectValueInCompartment(value, compartment()));
     getSlotRef(slot).set(this->asObjectPtr(), HeapSlot::Slot, slot, value);
 }
 
@@ -336,24 +312,9 @@ js::ObjectImpl::dynamicSlotsCount(uint32_t nfixed, uint32_t span)
 }
 
 inline size_t
-js::ObjectImpl::tenuredSizeOfThis() const
+js::ObjectImpl::sizeOfThis() const
 {
-    return js::gc::Arena::thingSize(tenuredGetAllocKind());
-}
-
-JS_ALWAYS_INLINE JS::Zone *
-js::ObjectImpl::zone() const
-{
-    return shape_->zone();
-}
-
-JS_ALWAYS_INLINE JS::Zone *
-ZoneOfValue(const JS::Value &value)
-{
-    JS_ASSERT(value.isMarkable());
-    if (value.isObject())
-        return value.toObject().zone();
-    return static_cast<js::gc::Cell *>(value.toGCThing())->tenuredZone();
+    return arenaHeader()->getThingSize();
 }
 
 /* static */ inline void
@@ -398,7 +359,7 @@ js::ObjectImpl::writeBarrierPre(ObjectImpl *obj)
      * This would normally be a null test, but TypeScript::global uses 0x1 as a
      * special value.
      */
-    if (IsNullTaggedPointer(obj))
+    if (uintptr_t(obj) < 32)
         return;
 
     Zone *zone = obj->zone();
@@ -415,7 +376,7 @@ js::ObjectImpl::writeBarrierPre(ObjectImpl *obj)
 js::ObjectImpl::writeBarrierPost(ObjectImpl *obj, void *addr)
 {
 #ifdef JSGC_GENERATIONAL
-    if (IsNullTaggedPointer(obj))
+    if (uintptr_t(obj) < 32)
         return;
     obj->runtime()->gcStoreBuffer.putCell((Cell **)addr);
 #endif

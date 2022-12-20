@@ -66,7 +66,6 @@ set(JS_SRCS
   src/gc/Statistics.cpp
   src/gc/StoreBuffer.cpp
   src/gc/Verifier.cpp
-  src/gc/Zone.cpp
   
   src/jsalloc.cpp
   src/jsanalyze.cpp
@@ -114,11 +113,6 @@ set(JS_SRCS
   src/jswrapper.cpp
   src/prmjtime.cpp)
 
-if(MOZ_INSTRUMENTS)
-  list(APPEND JS_SRCS
-    src/devtools/Instrument.cpp)
-endif()
-
 if(ENABLE_TRACE_LOGGING)
   list(APPEND JS_SRCS
     src/TraceLogging.cpp)
@@ -144,29 +138,18 @@ if(ENABLE_METHODJIT)
 
   if(ENABLE_ION)
     list(APPEND JS_SRCS
-      src/ion/shared/BaselineCompiler-shared.cpp
       src/ion/shared/CodeGenerator-shared.cpp
       src/ion/shared/Lowering-shared.cpp
       # TODO: Platform specific sources
 
       src/ion/AliasAnalysis.cpp
-      src/ion/AsmJS.cpp
-      src/ion/AsmJSLink.cpp
-      src/ion/ASMJSSignalHandlers.cpp
       src/ion/BacktracingAllocator.cpp
       src/ion/Bailouts.cpp
-      src/ion/BaselineBailouts.cpp
-      src/ion/BaselineCompiler.cpp
-      src/ion/BaselineFrame.cpp
-      src/ion/BaselineFrameInfo.cpp
-      src/ion/BaselineIC.cpp
-      src/ion/BaselineInspector.cpp
       src/ion/BaselineJIT.cpp
       src/ion/BitSet.cpp
       src/ion/C1Spewer.cpp
       src/ion/CodeGenerator.cpp
       src/ion/EdgeCaseAnalysis.cpp
-      src/ion/EffectiveAddressAnalysis.cpp
       src/ion/Ion.cpp
       src/ion/IonAnalysis.cpp
       src/ion/IonBuilder.cpp
@@ -201,8 +184,6 @@ if(ENABLE_METHODJIT)
   if(ENABLE_ION)
     list(APPEND JS_SRCS
       src/ion/shared/Assembler-x86-shared.cpp
-      src/ion/shared/BaselineCompiler-x86-shared.cpp
-      src/ion/shared/BaselineIC-x86-shared.cpp
       src/ion/shared/CodeGenerator-x86-shared.cpp
       src/ion/shared/IonFrames-x86-shared.cpp
       src/ion/shared/Lowering-x86-shared.cpp
@@ -218,8 +199,6 @@ if(ENABLE_METHODJIT)
     if(ENABLE_ION)
       list(APPEND JS_SRCS
         src/ion/x64/Assembler-x64.cpp
-        src/ion/x64/BaselineCompiler-x64.cpp
-        src/ion/x64/BaselineIC-x64.cpp
         src/ion/x64/CodeGenerator-x64.cpp
         src/ion/x64/IonFrames-x64.cpp
         src/ion/x64/Lowering-x64.cpp
@@ -229,8 +208,6 @@ if(ENABLE_METHODJIT)
     if(ENABLE_ION)
       list(APPEND JS_SRCS
         src/ion/x86/Assembler-x86.cpp
-        src/ion/x86/BaselineCompiler-x86.cpp
-        src/ion/x86/BaselineIC-x86.cpp
         src/ion/x86/CodeGenerator-x86.cpp
         src/ion/x86/IonFrames-x86.cpp
         src/ion/x86/Lowering-x86.cpp
@@ -259,16 +236,16 @@ if(WIN32)
     src/yarr/OSAllocatorWin.cpp)
 endif()
 
+#TODO
+#ifneq (,$(filter arm% sparc %86 x86_64 mips%,$(TARGET_CPU)))
 if(ENABLE_METHODJIT OR ENABLE_ION OR ENABLE_YARR_JIT)
+  add_definitions(-DENABLE_YARR_JIT=1)
+
   list(APPEND JS_SRCS
     src/assembler/assembler/ASMAssembler.cpp
     src/assembler/assembler/MacroAssemblerASM.cpp
-    src/assembler/assembler/MacroAssemblerX86Common.cpp)
-
-  if(ENABLE_YARR_JIT)
-  list(APPEND JS_SRCS
+    src/assembler/assembler/MacroAssemblerX86Common.cpp
     src/yarr/YarrJIT.cpp)
-  endif()
 endif()
 
 if(JS_HAS_CTYPES)
@@ -286,8 +263,6 @@ add_dependencies(js host_jsoplengen)
 target_include_directories(js
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/assembler
-    ${CMAKE_CURRENT_SOURCE_DIR}/../intl/icu/src/common
-    ${CMAKE_CURRENT_SOURCE_DIR}/../intl/icu/src/i18n
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/public
     # $:/src and BIN_DIR should be private but make public for now until
@@ -332,19 +307,20 @@ target_sources(js PRIVATE jsautooplen.h)
 set(SELFHOSTING_SRCS
   src/builtin/Utilities.js
   src/builtin/Array.js
-  src/builtin/Date.js
   src/builtin/Intl.js
-  src/builtin/IntlData.js
-  src/builtin/Number.js
-  src/builtin/ParallelArray.js
-  src/builtin/String.js)
+  src/builtin/IntlData.js)
 
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   # HINT: /EP flag is required for MSVC C++ compiler to work
-  COMMAND py src/builtin/embedjs.py -DDEBUG -p "${CMAKE_CXX_COMPILER} /EP" -m src/js.msg -o ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h -s ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.js ${SELFHOSTING_SRCS}
-  DEPENDS ${SELFHOSTING_SRCS} src/js.msg
+  COMMAND py src/builtin/embedjs.py -d ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h src/js.msg src/builtin/macros.py ${SELFHOSTING_SRCS}
+  DEPENDS
+    ${SELFHOSTING_SRCS}
+    src/builtin/embedjs.py
+    src/builtin/js2c.py
+    src/builtin/macros.py
+    src/js.msg
   COMMENT "Generating selfhosted.out.h"
   VERBATIM)
 
@@ -385,5 +361,11 @@ set(JS_PUBLIC_HDRS
 
 install(FILES ${JS_PUBLIC_HDRS}
   DESTINATION ${CMAKE_INSTALL_PREFIX}/include)
+
+install(FILES src/ds/BitArray.h
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/include/ds)
+
+install(FILES src/gc/Root.h
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/include/gc)
 ## End install directives
 ###############################################################################

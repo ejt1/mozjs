@@ -16,8 +16,6 @@
 #include "vm/SPSProfiler.h"
 #include "vm/StringBuffer.h"
 
-#include "ion/BaselineJIT.h"
-
 using namespace js;
 
 using mozilla::DebugOnly;
@@ -68,20 +66,11 @@ SPSProfiler::enable(bool enabled)
      * currently instrumented code is discarded
      */
     ReleaseAllJITCode(rt->defaultFreeOp());
-
-#ifdef JS_ION
-    /* Toggle SPS-related jumps on baseline jitcode.
-     * The call to |ReleaseAllJITCode| above will release most baseline jitcode, but not
-     * jitcode for scripts with active frames on the stack.  These scripts need to have
-     * their profiler state toggled so they behave properly.
-     */
-    ion::ToggleBaselineSPS(rt, enabled);
-#endif
 }
 
 /* Lookup the string for the function/script, creating one if necessary */
 const char*
-SPSProfiler::profileString(JSContext *cx, RawScript script, RawFunction maybeFun)
+SPSProfiler::profileString(JSContext *cx, UnrootedScript script, UnrootedFunction maybeFun)
 {
     JS_ASSERT(strings.initialized());
     ProfileStringMap::AddPtr s = strings.lookupForAdd(script);
@@ -98,7 +87,7 @@ SPSProfiler::profileString(JSContext *cx, RawScript script, RawFunction maybeFun
 }
 
 void
-SPSProfiler::onScriptFinalized(RawScript script)
+SPSProfiler::onScriptFinalized(UnrootedScript script)
 {
     /*
      * This function is called whenever a script is destroyed, regardless of
@@ -117,7 +106,7 @@ SPSProfiler::onScriptFinalized(RawScript script)
 }
 
 bool
-SPSProfiler::enter(JSContext *cx, RawScript script, RawFunction maybeFun)
+SPSProfiler::enter(JSContext *cx, UnrootedScript script, UnrootedFunction maybeFun)
 {
     const char *str = profileString(cx, script, maybeFun);
     if (str == NULL)
@@ -130,7 +119,7 @@ SPSProfiler::enter(JSContext *cx, RawScript script, RawFunction maybeFun)
 }
 
 void
-SPSProfiler::exit(JSContext *cx, RawScript script, RawFunction maybeFun)
+SPSProfiler::exit(JSContext *cx, UnrootedScript script, UnrootedFunction maybeFun)
 {
     pop();
 
@@ -163,7 +152,7 @@ SPSProfiler::exit(JSContext *cx, RawScript script, RawFunction maybeFun)
 }
 
 void
-SPSProfiler::push(const char *string, void *sp, RawScript script, jsbytecode *pc)
+SPSProfiler::push(const char *string, void *sp, UnrootedScript script, jsbytecode *pc)
 {
     /* these operations cannot be re-ordered, so volatile-ize operations */
     volatile ProfileEntry *stack = stack_;
@@ -195,7 +184,7 @@ SPSProfiler::pop()
  * AddPtr held while invoking allocProfileString.
  */
 const char*
-SPSProfiler::allocProfileString(JSContext *cx, RawScript script, RawFunction maybeFun)
+SPSProfiler::allocProfileString(JSContext *cx, UnrootedScript script, UnrootedFunction maybeFun)
 {
     DebugOnly<uint64_t> gcBefore = cx->runtime->gcNumber;
     StringBuffer buf(cx);
@@ -206,8 +195,8 @@ SPSProfiler::allocProfileString(JSContext *cx, RawScript script, RawFunction may
         if (!buf.append(" ("))
             return NULL;
     }
-    if (script->filename()) {
-        if (!buf.appendInflated(script->filename(), strlen(script->filename())))
+    if (script->filename) {
+        if (!buf.appendInflated(script->filename, strlen(script->filename)))
             return NULL;
     } else if (!buf.append("<unknown>")) {
         return NULL;
@@ -247,6 +236,8 @@ JMChunkInfo::JMChunkInfo(mjit::JSActiveFrame *frame,
     chunk(chunk)
 {}
 
+// Use RawScript instead of UnrootedScript because this may be called from a
+// signal handler.
 jsbytecode*
 SPSProfiler::ipToPC(RawScript script, size_t ip)
 {
@@ -275,6 +266,8 @@ SPSProfiler::ipToPC(RawScript script, size_t ip)
     return NULL;
 }
 
+// Use RawScript instead of UnrootedScript because this may be called from a
+// signal handler.
 jsbytecode*
 JMChunkInfo::convert(RawScript script, size_t ip)
 {
@@ -374,7 +367,7 @@ SPSProfiler::registerScript(mjit::JSActiveFrame *frame,
 
 bool
 SPSProfiler::registerICCode(mjit::JITChunk *chunk,
-                            RawScript script, jsbytecode *pc,
+                            UnrootedScript script, jsbytecode *pc,
                             void *base, size_t size)
 {
     JS_ASSERT(jminfo.initialized());
@@ -387,6 +380,7 @@ void
 SPSProfiler::discardMJITCode(mjit::JITScript *jscr,
                              mjit::JITChunk *chunk, void* address)
 {
+    AutoAssertNoGC nogc;
     if (!jminfo.initialized())
         return;
 
@@ -396,7 +390,7 @@ SPSProfiler::discardMJITCode(mjit::JITScript *jscr,
 }
 
 void
-SPSProfiler::unregisterScript(RawScript script, mjit::JITChunk *chunk)
+SPSProfiler::unregisterScript(UnrootedScript script, mjit::JITChunk *chunk)
 {
     JITInfoMap::Ptr ptr = jminfo.lookup(script);
     if (!ptr)

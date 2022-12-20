@@ -24,7 +24,7 @@ LAllocation *
 StupidAllocator::stackLocation(uint32_t vreg)
 {
     LDefinition *def = virtualRegisters[vreg];
-    if (def->policy() == LDefinition::PRESET && def->output()->isArgument())
+    if (def->policy() == LDefinition::PRESET && def->output()->kind() == LAllocation::ARGUMENT)
         return def->output();
 
     return new LStackSlot(DefaultStackSlot(vreg), def->type() == LDefinition::DOUBLE);
@@ -50,7 +50,7 @@ StupidAllocator::init()
     if (!virtualRegisters.reserve(graph.numVirtualRegisters()))
         return false;
     for (size_t i = 0; i < graph.numVirtualRegisters(); i++)
-        virtualRegisters.infallibleAppend((LDefinition *)NULL);
+        virtualRegisters.infallibleAppend(NULL);
 
     for (size_t i = 0; i < graph.numBlocks(); i++) {
         LBlock *block = graph.getBlock(i);

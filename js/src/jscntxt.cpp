@@ -110,7 +110,7 @@ js::TraceCycleDetectionSet(JSTracer *trc, js::ObjectSet &set)
 }
 
 void
-JSRuntime::sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf, JS::RuntimeSizes *rtSizes)
+JSRuntime::sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf, RuntimeSizes *rtSizes)
 {
     rtSizes->object = mallocSizeOf(this);
 
@@ -124,9 +124,15 @@ JSRuntime::sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf, JS::RuntimeSizes 
 
     rtSizes->temporary = tempLifoAlloc.sizeOfExcludingThis(mallocSizeOf);
 
-    rtSizes->code = JS::CodeSizes();
-    if (execAlloc_)
-        execAlloc_->sizeOfCode(&rtSizes->code);
+    if (execAlloc_) {
+        execAlloc_->sizeOfCode(&rtSizes->jaegerCode, &rtSizes->ionCode, &rtSizes->regexpCode,
+                               &rtSizes->unusedCode);
+    } else {
+        rtSizes->jaegerCode = 0;
+        rtSizes->ionCode    = 0;
+        rtSizes->regexpCode = 0;
+        rtSizes->unusedCode = 0;
+    }
 
     rtSizes->regexpData = bumpAlloc_ ? bumpAlloc_->sizeOfNonHeapData() : 0;
 
@@ -135,6 +141,10 @@ JSRuntime::sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf, JS::RuntimeSizes 
     rtSizes->gcMarker = gcMarker.sizeOfExcludingThis(mallocSizeOf);
 
     rtSizes->mathCache = mathCache_ ? mathCache_->sizeOfIncludingThis(mallocSizeOf) : 0;
+
+    rtSizes->scriptFilenames = scriptFilenameTable.sizeOfExcludingThis(mallocSizeOf);
+    for (ScriptFilenameTable::Range r = scriptFilenameTable.all(); !r.empty(); r.popFront())
+        rtSizes->scriptFilenames += mallocSizeOf(r.front());
 
     rtSizes->scriptData = scriptDataTable.sizeOfExcludingThis(mallocSizeOf);
     for (ScriptDataTable::Range r = scriptDataTable.all(); !r.empty(); r.popFront())
@@ -147,10 +157,9 @@ JSRuntime::sizeOfExplicitNonHeap()
     size_t n = stackSpace.sizeOf();
 
     if (execAlloc_) {
-        JS::CodeSizes sizes;
-        execAlloc_->sizeOfCode(&sizes);
-        n += sizes.jaeger + sizes.ion + sizes.baseline + sizes.asmJS +
-            sizes.regexp + sizes.other + sizes.unused;
+        size_t jaegerCode, ionCode, regexpCode, unusedCode;
+        execAlloc_->sizeOfCode(&jaegerCode, &ionCode, &regexpCode, &unusedCode);
+        n += jaegerCode + ionCode + regexpCode + unusedCode;
     }
 
     if (bumpAlloc_)
@@ -168,18 +177,13 @@ JSRuntime::triggerOperationCallback()
      * into a weird state where interrupt is stuck at 0 but ionStackLimit is
      * MAXADDR.
      */
-    mainThread.setIonStackLimit(-1);
+    mainThread.ionStackLimit = -1;
 
     /*
      * Use JS_ATOMIC_SET in the hope that it ensures the write will become
      * immediately visible to other processors polling the flag.
      */
     JS_ATOMIC_SET(&interrupt, 1);
-
-#ifdef JS_ION
-    /* asm.js code uses a separate mechanism to halt running code. */
-    TriggerOperationCallbackForAsmJSCode(this);
-#endif
 }
 
 void
@@ -258,7 +262,7 @@ JSCompartment::sweepCallsiteClones()
         for (CallsiteCloneTable::Enum e(callsiteClones); !e.empty(); e.popFront()) {
             CallsiteCloneKey key = e.front().key;
             JSFunction *fun = e.front().value;
-            if (!IsScriptMarked(&key.script) || !IsObjectMarked(&fun))
+            if (!key.script->isMarked() || !fun->isMarked())
                 e.removeFront();
         }
     }
@@ -268,9 +272,9 @@ RawFunction
 js::CloneFunctionAtCallsite(JSContext *cx, HandleFunction fun, HandleScript script, jsbytecode *pc)
 {
     JS_ASSERT(cx->typeInferenceEnabled());
-    JS_ASSERT(fun->nonLazyScript()->shouldCloneAtCallsite);
-    JS_ASSERT(!fun->nonLazyScript()->enclosingStaticScope());
+    JS_ASSERT(fun->isCloneAtCallsite());
     JS_ASSERT(types::UseNewTypeForClone(fun));
+    JS_ASSERT(!fun->nonLazyScript()->enclosingStaticScope());
 
     typedef CallsiteCloneKey Key;
     typedef CallsiteCloneTable Table;
@@ -297,8 +301,7 @@ js::CloneFunctionAtCallsite(JSContext *cx, HandleFunction fun, HandleScript scri
         return NULL;
 
     // Store a link back to the original for function.caller.
-    clone->nonLazyScript()->isCallsiteClone = true;
-    clone->nonLazyScript()->setOriginalFunctionObject(fun);
+    clone->setExtendedSlot(0, ObjectValue(*fun));
 
     // Recalculate the hash if script or fun have been moved.
     if (key.script != script && key.original != fun) {
@@ -420,14 +423,12 @@ js::DestroyContext(JSContext *cx, DestroyContextMode mode)
         /* Clear the statics table to remove GC roots. */
         rt->staticStrings.finish();
 
-        rt->finishSelfHosting();
-
-        JS::PrepareForFullGC(rt);
-        GC(rt, GC_NORMAL, JS::gcreason::LAST_CONTEXT);
+        PrepareForFullGC(rt);
+        GC(rt, GC_NORMAL, gcreason::LAST_CONTEXT);
     } else if (mode == DCM_FORCE_GC) {
         JS_ASSERT(!rt->isHeapBusy());
-        JS::PrepareForFullGC(rt);
-        GC(rt, GC_NORMAL, JS::gcreason::DESTROY_CONTEXT);
+        PrepareForFullGC(rt);
+        GC(rt, GC_NORMAL, gcreason::DESTROY_CONTEXT);
     }
     js_delete(cx);
 }
@@ -449,6 +450,8 @@ static void
 ReportError(JSContext *cx, const char *message, JSErrorReport *reportp,
             JSErrorCallback callback, void *userRef)
 {
+    AssertCanGC();
+
     /*
      * Check the error report, and set a JavaScript-catchable exception
      * if the error is defined to have an associated exception.  If an
@@ -493,6 +496,8 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp,
 static void
 PopulateReportBlame(JSContext *cx, JSErrorReport *report)
 {
+    AutoAssertNoGC nogc;
+
     /*
      * Walk stack until we find a frame that is associated with a non-builtin
      * rather than a builtin frame.
@@ -501,7 +506,7 @@ PopulateReportBlame(JSContext *cx, JSErrorReport *report)
     if (iter.done())
         return;
 
-    report->filename = iter.script()->filename();
+    report->filename = iter.script()->filename;
     report->lineno = PCToLineNumber(iter.script(), iter.pc(), &report->column);
     report->originPrincipals = iter.script()->originPrincipals;
 }
@@ -516,6 +521,8 @@ PopulateReportBlame(JSContext *cx, JSErrorReport *report)
 void
 js_ReportOutOfMemory(JSContext *cx)
 {
+    AutoAssertNoGC nogc;
+
     cx->runtime->hadOutOfMemory = true;
 
     JSErrorReport report;
@@ -585,7 +592,7 @@ checkReportFlags(JSContext *cx, unsigned *flags)
          * We assume that if the top frame is a native, then it is strict if
          * the nearest scripted frame is strict, see bug 536306.
          */
-        RawScript script = cx->stack.currentScript();
+        UnrootedScript script = cx->stack.currentScript();
         if (script && script->strict)
             *flags &= ~JSREPORT_WARNING;
         else if (cx->hasStrictOption())
@@ -1154,6 +1161,12 @@ js_HandleExecutionInterrupt(JSContext *cx)
     return result;
 }
 
+jsbytecode*
+js_GetCurrentBytecodePC(JSContext* cx)
+{
+    return cx->hasfp() ? cx->regs().pc : NULL;
+}
+
 JSContext::JSContext(JSRuntime *rt)
   : ContextFriendFields(rt),
     defaultVersion(JSVERSION_DEFAULT),
@@ -1194,11 +1207,11 @@ JSContext::JSContext(JSRuntime *rt)
     JS_ASSERT(static_cast<ContextFriendFields*>(this) ==
               ContextFriendFields::get(this));
 
-#if defined(JSGC_ROOT_ANALYSIS) || defined(JSGC_USE_EXACT_ROOTING)
+#ifdef JSGC_ROOT_ANALYSIS
     PodArrayZero(thingGCRooters);
-#endif
-#if defined(DEBUG) && defined(JS_GC_ZEAL) && defined(JSGC_ROOT_ANALYSIS) && !defined(JS_THREADSAFE)
+#if defined(JS_GC_ZEAL) && defined(DEBUG) && !defined(JS_THREADSAFE)
     skipGCRooters = NULL;
+#endif
 #endif
 }
 
@@ -1305,9 +1318,9 @@ JSContext::saveFrameChain()
     }
 
     if (defaultCompartmentObject_)
-        setCompartment(defaultCompartmentObject_->compartment());
+        compartment = defaultCompartmentObject_->compartment();
     else
-        setCompartment(NULL);
+        compartment = NULL;
     enterCompartmentDepth_ = 0;
 
     if (isExceptionPending())
@@ -1319,7 +1332,7 @@ void
 JSContext::restoreFrameChain()
 {
     SavedFrameChain sfc = savedFrameChains_.popCopy();
-    setCompartment(sfc.compartment);
+    compartment = sfc.compartment;
     enterCompartmentDepth_ = sfc.enterCompartmentCount;
 
     stack.restoreFrameChain();
@@ -1362,7 +1375,7 @@ JSRuntime::updateMallocCounter(JS::Zone *zone, size_t nbytes)
 JS_FRIEND_API(void)
 JSRuntime::onTooMuchMalloc()
 {
-    TriggerGC(this, JS::gcreason::TOO_MUCH_MALLOC);
+    TriggerGC(this, gcreason::TOO_MUCH_MALLOC);
 }
 
 JS_FRIEND_API(void *)
@@ -1381,7 +1394,7 @@ JSRuntime::onOutOfMemory(void *p, size_t nbytes, JSContext *cx)
      * Retry when we are done with the background sweeping and have stopped
      * all the allocations and released the empty GC chunks.
      */
-    JS::ShrinkGCBuffers(this);
+    ShrinkGCBuffers(this);
     gcHelperThread.waitBackgroundSweepOrAllocEnd();
     if (!p)
         p = js_malloc(nbytes);
@@ -1515,7 +1528,7 @@ JSContext::mark(JSTracer *trc)
 
 #if defined JS_THREADSAFE && defined DEBUG
 
-JS::AutoCheckRequestDepth::AutoCheckRequestDepth(JSContext *cx)
+AutoCheckRequestDepth::AutoCheckRequestDepth(JSContext *cx)
     : cx(cx)
 {
     JS_ASSERT(cx->runtime->requestDepth || cx->runtime->isHeapBusy());
@@ -1523,7 +1536,7 @@ JS::AutoCheckRequestDepth::AutoCheckRequestDepth(JSContext *cx)
     cx->runtime->checkRequestDepth++;
 }
 
-JS::AutoCheckRequestDepth::~AutoCheckRequestDepth()
+AutoCheckRequestDepth::~AutoCheckRequestDepth()
 {
     JS_ASSERT(cx->runtime->checkRequestDepth != 0);
     cx->runtime->checkRequestDepth--;

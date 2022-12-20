@@ -10,7 +10,6 @@
 
 #include "gc/Barrier.h"
 #include "gc/Marking.h"
-#include "gc/StoreBuffer.h"
 
 #include "vm/ObjectImpl-inl.h"
 #include "vm/String-inl.h"
@@ -43,36 +42,14 @@ RelocatablePtr<T>::relocate(JSRuntime *rt)
 #endif
 }
 
-inline
-EncapsulatedValue::~EncapsulatedValue()
-{
-    pre();
-}
-
-inline EncapsulatedValue &
-EncapsulatedValue::operator=(const Value &v)
-{
-    pre();
-    JS_ASSERT(!IsPoisonedValue(v));
-    value = v;
-    return *this;
-}
-
-inline EncapsulatedValue &
-EncapsulatedValue::operator=(const EncapsulatedValue &v)
-{
-    pre();
-    JS_ASSERT(!IsPoisonedValue(v));
-    value = v.get();
-    return *this;
-}
-
 inline void
 EncapsulatedValue::writeBarrierPre(const Value &value)
 {
 #ifdef JSGC_INCREMENTAL
-    if (value.isMarkable())
-        writeBarrierPre(ZoneOfValue(value), value);
+    if (value.isMarkable()) {
+        js::gc::Cell *cell = (js::gc::Cell *)value.toGCThing();
+        writeBarrierPre(cell->zone(), value);
+    }
 #endif
 }
 
@@ -170,8 +147,9 @@ HeapValue::set(Zone *zone, const Value &v)
 {
 #ifdef DEBUG
     if (value.isMarkable()) {
-        JS_ASSERT(ZoneOfValue(value) == zone ||
-                  ZoneOfValue(value) == zone->rt->atomsCompartment->zone());
+        js::gc::Cell *cell = (js::gc::Cell *)value.toGCThing();
+        JS_ASSERT(cell->zone() == zone ||
+                  cell->zone() == zone->rt->atomsCompartment->zone());
     }
 #endif
 
@@ -413,19 +391,6 @@ DenseRangeWriteBarrierPost(JSRuntime *rt, JSObject *obj, uint32_t start, uint32_
 #ifdef JSGC_GENERATIONAL
     if (count > 0)
         rt->gcStoreBuffer.putGeneric(DenseRangeRef(obj, start, start + count));
-#endif
-}
-
-/*
- * This is a post barrier for HashTables whose key can be moved during a GC.
- */
-template <class Map, class Key>
-inline void
-HashTableWriteBarrierPost(JSRuntime *rt, Map *map, const Key &key)
-{
-#ifdef JSGC_GENERATIONAL
-    if (key && IsInsideNursery(rt, key))
-        rt->gcStoreBuffer.putGeneric(gc::HashKeyRef<Map, Key>(map, key));
 #endif
 }
 

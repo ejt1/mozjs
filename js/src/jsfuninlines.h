@@ -29,7 +29,7 @@ JSFunction::initAtom(JSAtom *atom)
 }
 
 inline void
-JSFunction::setGuessedAtom(js::RawAtom atom)
+JSFunction::setGuessedAtom(js::UnrootedAtom atom)
 {
     JS_ASSERT(atom_ == NULL);
     JS_ASSERT(atom != NULL);
@@ -142,7 +142,7 @@ GetFunctionNameBytes(JSContext *cx, JSFunction *fun, JSAutoByteString *bytes)
 {
     JSAtom *atom = fun->atom();
     if (atom)
-        return bytes->encodeLatin1(cx, atom);
+        return bytes->encode(cx, atom);
     return js_anonymous_str;
 }
 
@@ -189,14 +189,7 @@ CloneFunctionObjectIfNotSingleton(JSContext *cx, HandleFunction fun, HandleObjec
         }
     }
 
-    // These intermediate variables are needed to avoid link errors on some
-    // platforms.  Sigh.
-    gc::AllocKind finalizeKind = JSFunction::FinalizeKind;
-    gc::AllocKind extendedFinalizeKind = JSFunction::ExtendedFinalizeKind;
-    gc::AllocKind kind = fun->isExtended()
-                         ? extendedFinalizeKind
-                         : finalizeKind;
-    return CloneFunctionObject(cx, fun, parent, kind);
+    return CloneFunctionObject(cx, fun, parent);
 }
 
 } /* namespace js */
@@ -213,16 +206,6 @@ JSFunction::initScript(JSScript *script_)
 {
     JS_ASSERT(isInterpreted());
     mutableScript().init(script_);
-}
-
-inline JSObject *
-JSFunction::getBoundFunctionTarget() const
-{
-    JS_ASSERT(isFunction());
-    JS_ASSERT(isBoundFunction());
-
-    /* Bound functions abuse |parent| to store their target function. */
-    return getParent();
 }
 
 #endif /* jsfuninlines_h___ */
