@@ -1,17 +1,4 @@
 ###############################################################################
-## Begin definitions
-# TODO: Just temporarily define these to successfully compile and move later.
-add_definitions(-DSTATIC_JS_API)
-add_definitions(-DJS_DEFAULT_JITREPORT_GRANULARITY=3)
-add_definitions(-DWIN32)
-if(CMAKE_SIZEOF_VOID_P MATCHES 8)
-  add_definitions(-D_AMD64_)
-else()
-  add_definitions(-D_X86_)
-endif()
-add_definitions(-DMOZILLA_VERSION="24.8.1")
-## End definitions
-###############################################################################
 ## Begin source files
 set(JS_SRCS
   src/assembler/jit/ExecutableAllocator.cpp
@@ -19,12 +6,12 @@ set(JS_SRCS
   src/builtin/Eval.cpp
   src/builtin/Intl.cpp
   src/builtin/MapObject.cpp
-  src/builtin/Module.cpp
   src/builtin/Object.cpp
-  src/builtin/ParallelArray.cpp
   src/builtin/Profilers.cpp
   src/builtin/RegExp.cpp
+  src/builtin/SIMD.cpp
   src/builtin/TestingFunctions.cpp
+  src/builtin/TypedObject.cpp
 
   src/devtools/sharkctl.cpp
 
@@ -39,30 +26,7 @@ set(JS_SRCS
   src/frontend/Parser.cpp
   src/frontend/TokenStream.cpp
   
-  src/vm/ArgumentsObject.cpp
-  src/vm/CharacterEncoding.cpp
-  src/vm/DateTime.cpp
-  src/vm/Debugger.cpp
-  src/vm/ForkJoin.cpp
-  src/vm/GlobalObject.cpp
-  src/vm/Interpreter.cpp
-  src/vm/Monitor.cpp
-  src/vm/ObjectImpl.cpp
-  src/vm/Probes.cpp
-  src/vm/PropertyKey.cpp
-  src/vm/RegExpObject.cpp
-  src/vm/RegExpStatics.cpp
-  src/vm/ScopeObject.cpp
-  src/vm/SelfHosting.cpp
-  src/vm/Shape.cpp
-  src/vm/SPSProfiler.cpp
-  src/vm/Stack.cpp
-  src/vm/String.cpp
-  src/vm/StringBuffer.cpp
-  src/vm/ThreadPool.cpp
-  src/vm/Unicode.cpp
-  src/vm/Xdr.cpp
-  
+  src/gc/Barrier.cpp
   src/gc/Iteration.cpp
   src/gc/Marking.cpp
   src/gc/Memory.cpp
@@ -70,8 +34,52 @@ set(JS_SRCS
   src/gc/RootMarking.cpp
   src/gc/Statistics.cpp
   src/gc/StoreBuffer.cpp
+  src/gc/Tracer.cpp
   src/gc/Verifier.cpp
   src/gc/Zone.cpp
+
+  src/perf/jsperf.cpp
+  
+  src/vm/ArgumentsObject.cpp
+  src/vm/ArrayBufferObject.cpp
+  src/vm/CallNonGenericMethod.cpp
+  src/vm/CharacterEncoding.cpp
+  src/vm/Compression.cpp
+  src/vm/DateTime.cpp
+  src/vm/Debugger.cpp
+  src/vm/DebuggerMemory.cpp
+  src/vm/ErrorObject.cpp
+  src/vm/ForkJoin.cpp
+  src/vm/GlobalObject.cpp
+  src/vm/Id.cpp
+  src/vm/Interpreter.cpp
+  src/vm/MemoryMetrics.cpp
+  src/vm/Monitor.cpp
+  src/vm/ObjectImpl.cpp
+  src/vm/OldDebugAPI.cpp
+  src/vm/PIC.cpp
+  src/vm/Probes.cpp
+  src/vm/PropertyKey.cpp
+  src/vm/ProxyObject.cpp
+  src/vm/RegExpObject.cpp
+  src/vm/RegExpStatics.cpp
+  src/vm/Runtime.cpp
+  src/vm/SavedStacks.cpp
+  src/vm/ScopeObject.cpp
+  src/vm/SelfHosting.cpp
+  src/vm/Shape.cpp
+  src/vm/SharedArrayObject.cpp
+  src/vm/SPSProfiler.cpp
+  src/vm/Stack.cpp
+  src/vm/String.cpp
+  src/vm/StringBuffer.cpp
+  src/vm/StructuredClone.cpp
+  src/vm/ThreadPool.cpp
+  src/vm/TypedArrayObject.cpp
+  src/vm/Unicode.cpp
+  src/vm/Value.cpp
+  src/vm/WeakMapPtr.cpp
+  src/vm/Xdr.cpp
 
   src/yarr/PageBlock.cpp
   src/yarr/YarrCanonicalizeUCS2.cpp
@@ -85,12 +93,10 @@ set(JS_SRCS
   src/jsarray.cpp
   src/jsatom.cpp
   src/jsbool.cpp
-  src/jsclone.cpp
   src/jscntxt.cpp
   src/jscompartment.cpp
   src/jscrashreport.cpp
   src/jsdate.cpp
-  src/jsdbgapi.cpp
   src/jsdtoa.cpp
   src/jsexn.cpp
   src/jsfriendapi.cpp
@@ -99,7 +105,6 @@ set(JS_SRCS
   src/jsinfer.cpp
   src/jsiter.cpp
   src/jsmath.cpp
-  src/jsmemorymetrics.cpp
   src/jsnativestack.cpp
   src/jsnum.cpp
   src/jsobj.cpp
@@ -112,13 +117,17 @@ set(JS_SRCS
   src/jsreflect.cpp
   src/jsscript.cpp
   src/jsstr.cpp
-  src/jstypedarray.cpp
   src/jsutil.cpp
   src/jswatchpoint.cpp
   src/jsweakmap.cpp
   src/jsworkers.cpp
   src/jswrapper.cpp
   src/prmjtime.cpp)
+
+if(JS_POSIX_NSPR)
+  list(APPEND JS_SRCS
+    src/vm/PosixNSPR.cpp)
+endif()
 
 if(MOZ_INSTRUMENTS)
   list(APPEND JS_SRCS
@@ -127,11 +136,12 @@ endif()
 
 if(ENABLE_TRACE_LOGGING)
   list(APPEND JS_SRCS
-    src/TraceLogging.cpp)
+    src/vm/TraceLogging.cpp)
 endif()
 
 if(ENABLE_ION)
   list(APPEND JS_SRCS
+    src/jit/shared/BaselineCompiler-shared.cpp
     src/jit/shared/CodeGenerator-shared.cpp
     src/jit/shared/Lowering-shared.cpp
     # TODO: Platform specific sources
@@ -139,11 +149,13 @@ if(ENABLE_ION)
     src/jit/AliasAnalysis.cpp
     src/jit/AsmJS.cpp
     src/jit/AsmJSLink.cpp
+    src/jit/AsmJSModule.cpp
     src/jit/AsmJSSignalHandlers.cpp
     src/jit/BacktracingAllocator.cpp
     src/jit/Bailouts.cpp
     src/jit/BaselineBailout.cpp
     src/jit/BaselineCompiler.cpp
+    src/jit/BaselineDebugModeOSR.cpp
     src/jit/BaselineFrame.cpp
     src/jit/BaselineFrameInfo.cpp
     src/jit/BaselineIC.cpp
@@ -153,6 +165,7 @@ if(ENABLE_ION)
     src/jit/BytecodeAnalysis.cpp
     src/jit/C1Spewer.cpp
     src/jit/CodeGenerator.cpp
+    src/jit/CompileWrappers.cpp
     src/jit/EdgeCaseAnalysis.cpp
     src/jit/EffectiveAddressAnalysis.cpp
     src/jit/Ion.cpp
@@ -161,7 +174,9 @@ if(ENABLE_ION)
     src/jit/IonCaches.cpp
     src/jit/IonFrames.cpp
     src/jit/IonMacroAssembler.cpp
+    src/jit/IonOptimizationLevels.cpp
     src/jit/IonSpewer.cpp
+    src/jit/JitOptions.cpp
     src/jit/JSONSpewer.cpp
     src/jit/LICM.cpp
     src/jit/LinearScan.cpp
@@ -172,14 +187,17 @@ if(ENABLE_ION)
     src/jit/MIR.cpp
     src/jit/MIRGraph.cpp
     src/jit/MoveResolver.cpp
-    src/jit/ParallelArrayAnalysis.cpp
     src/jit/ParallelFunctions.cpp
+    src/jit/ParallelSafetyAnalysis.cpp
     src/jit/PerfSpewer.cpp
     src/jit/RangeAnalysis.cpp
+    src/jit/Recover.cpp
     src/jit/RegisterAllocator.cpp
+    src/jit/RematerializedFrame.cpp
     src/jit/Safepoints.cpp
     src/jit/Snapshots.cpp
     src/jit/StupidAllocator.cpp
+    src/jit/TypeDescrSet.cpp
     src/jit/TypePolicy.cpp
     src/jit/UnreachableCodeElimination.cpp
     src/jit/ValueNumbering.cpp
@@ -192,8 +210,8 @@ if(ENABLE_ION)
     src/jit/shared/BaselineCompiler-x86-shared.cpp
     src/jit/shared/BaselineIC-x86-shared.cpp
     src/jit/shared/CodeGenerator-x86-shared.cpp
-    src/jit/shared/IonFrames-x86-shared.cpp
     src/jit/shared/Lowering-x86-shared.cpp
+    src/jit/shared/MacroAssembler-x86-shared.cpp
     src/jit/shared/MoveEmitter-x86-shared.cpp)
 
   if(PLATFORM_ARCH MATCHES 64)
@@ -223,15 +241,23 @@ if(WIN32)
   list(APPEND JS_SRCS
     src/assembler/jit/ExecutableAllocatorWin.cpp
     src/yarr/OSAllocatorWin.cpp)
+else()
+  list(APPEND JS_SRCS
+    src/assembler/jit/ExecutableAllocatorPosix.cpp
+    src/yarr/OSAllocatorPosix.cpp)
 endif()
 
 #TODO
 #ifneq (,$(filter arm% sparc %86 x86_64 mips%,$(TARGET_CPU)))
 if(ENABLE_ION OR ENABLE_YARR_JIT)
-  list(APPEND JS_SRCS
-    src/assembler/assembler/ASMAssembler.cpp
-    src/assembler/assembler/MacroAssemblerASM.cpp
-    src/assembler/assembler/MacroAssemblerX86Common.cpp)
+  if(JS_CODEGEN_X86 OR JS_CODEGEN_X64)
+    list(APPEND JS_SRCS
+      src/assembler/assembler/MacroAssemblerX86Common.cpp)
+  else()
+    list(APPEND JS_SRCS
+      src/assembler/assembler/ARMAssembler.cpp
+      src/assembler/assembler/MacroAssemblerARM.cpp)
+  endif()
 endif()
 
 if(ENABLE_YARR_JIT)
@@ -243,6 +269,11 @@ if(JS_HAS_CTYPES)
   list(APPEND JS_SRCS
     src/ctypes/CTypes.cpp
     src/ctypes/Library.cpp)
+endif()
+
+if(MOZ_VTUNE)
+  list(APPEND JS_SRCS
+    src/vtune/jitprofiling.c)
 endif()
 
 if(HAVE_LINUX_PERF_EVENT_H)
@@ -257,7 +288,7 @@ endif()
 ## Begin static library
 add_library(js ${JS_SRCS})
 
-add_dependencies(js host_jsoplengen)
+add_dependencies(js host_jskwgen)
 
 target_include_directories(js
   PRIVATE
@@ -293,27 +324,31 @@ add_custom_command(
 set_source_files_properties(jsautokw.h PROPERTIES GENERATED TRUE)
 target_sources(js PRIVATE jsautokw.h)
 
-add_executable(host_jsoplengen src/jsoplengen.cpp)
-
-add_custom_command(
-  OUTPUT jsautooplen.h
-  COMMAND host_jsoplengen jsautooplen.h
-  DEPENDS host_jsoplengen
-  COMMENT "Generating jsautooplen.h"
-  VERBATIM)
-
-set_source_files_properties(jsautooplen.h PROPERTIES GENERATED TRUE)
-target_sources(js PRIVATE jsautooplen.h)
+#add_executable(host_jsoplengen src/jsoplengen.cpp)
+#
+#add_custom_command(
+#  OUTPUT jsautooplen.h
+#  COMMAND host_jsoplengen jsautooplen.h
+#  DEPENDS host_jsoplengen
+#  COMMENT "Generating jsautooplen.h"
+#  VERBATIM)
+#
+#set_source_files_properties(jsautooplen.h PROPERTIES GENERATED TRUE)
+#target_sources(js PRIVATE jsautooplen.h)
 
 set(SELFHOSTING_SRCS
   src/builtin/Utilities.js
+  src/builtin/ParallelUtilities.js
   src/builtin/Array.js
   src/builtin/Date.js
   src/builtin/Intl.js
   src/builtin/IntlData.js
+  src/builtin/Iterator.js
+  src/builtin/Map.js
   src/builtin/Number.js
-  src/builtin/ParallelArray.js
-  src/builtin/String.js)
+  src/builtin/String.js
+  src/builtin/Set.js
+  src/builtin/TypedObject.js)
 
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h
@@ -340,19 +375,15 @@ set(JS_PUBLIC_HDRS
   src/js.msg
   src/jsapi.h
   src/jsalloc.h
-  src/jsclass.h
+  src/jsbytecode.h
   src/jsclist.h
   src/jscpucfg.h
-  src/jsdbgapi.h
   src/jsfriendapi.h
-  src/jslock.h
   src/jsproxy.h
   src/jsprf.h
   src/jsprototypes.h
-  src/jsprvtd.h
   src/jspubtd.h
   src/jstypes.h
-  src/jsutil.h
   src/jsversion.h
   src/jswrapper.h)
 

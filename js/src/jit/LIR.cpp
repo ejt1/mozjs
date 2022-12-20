@@ -4,38 +4,54 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include "MIR.h"
-#include "MIRGraph.h"
-#include "LIR.h"
-#include "IonSpewer.h"
-#include "LIR-inl.h"
-#include "shared/CodeGenerator-shared.h"
+#include "jit/LIR.h"
+
+#include <ctype.h>
+
+#include "jsprf.h"
+
+#include "jit/IonSpewer.h"
+#include "jit/MIR.h"
+#include "jit/MIRGenerator.h"
+
 using namespace js;
 using namespace js::jit;
 
-LIRGraph::LIRGraph(MIRGraph *mir)
-  : numVirtualRegisters_(0),
+LIRGraph::LIRGraph(MIRGraph* mir)
+  : blocks_(mir->alloc()),
+    constantPool_(mir->alloc()),
+    constantPoolMap_(mir->alloc()),
+    safepoints_(mir->alloc()),
+    nonCallSafepoints_(mir->alloc()),
+    numVirtualRegisters_(0),
     numInstructions_(1), // First id is 1.
     localSlotCount_(0),
     argumentSlotCount_(0),
-    entrySnapshot_(NULL),
-    osrBlock_(NULL),
+    entrySnapshot_(nullptr),
+    osrBlock_(nullptr),
     mir_(*mir)
 {
 }
 
 bool
-LIRGraph::addConstantToPool(const Value &v, uint32_t *index)
+LIRGraph::addConstantToPool(const Value& v, uint32_t* index)
 {
+    JS_ASSERT(constantPoolMap_.initialized());
+
+    ConstantPoolMap::AddPtr p = constantPoolMap_.lookupForAdd(v);
+    if (p) {
+        *index = p->value();
+        return true;
+    }
     *index = constantPool_.length();
-    return constantPool_.append(v);
+    return constantPool_.append(v) && constantPoolMap_.add(p, v, *index);
 }
 
 bool
-LIRGraph::noteNeedsSafepoint(LInstruction *ins)
+LIRGraph::noteNeedsSafepoint(LInstruction* ins)
 {
     // Instructions with safepoints must be in linear order.
-    JS_ASSERT_IF(safepoints_.length(), safepoints_[safepoints_.length() - 1]->id() < ins->id());
+    JS_ASSERT_IF(!safepoints_.empty(), safepoints_.back()->id() < ins->id());
     if (!ins->isCall() && !nonCallSafepoints_.append(ins))
         return false;
     return safepoints_.append(ins);
@@ -45,12 +61,6 @@ void
 LIRGraph::removeBlock(size_t i)
 {
     blocks_.erase(blocks_.begin() + i);
-}
-
-Label *
-LBlock::label()
-{
-    return begin()->toLabel()->label();
 }
 
 uint32_t
@@ -69,36 +79,39 @@ LBlock::firstId()
 uint32_t
 LBlock::lastId()
 {
-    LInstruction *last = *instructions_.rbegin();
+    LInstruction* last = *instructions_.rbegin();
     JS_ASSERT(last->id());
-    if (last->numDefs())
-        return last->getDef(last->numDefs() - 1)->virtualRegister();
+    // The last instruction is a control flow instruction which does not have
+    // any output.
+    JS_ASSERT(last->numDefs() == 0);
     return last->id();
 }
 
-LMoveGroup *
-LBlock::getEntryMoveGroup()
+LMoveGroup*
+LBlock::getEntryMoveGroup(TempAllocator& alloc)
 {
     if (entryMoveGroup_)
         return entryMoveGroup_;
-    entryMoveGroup_ = new LMoveGroup;
-    JS_ASSERT(begin()->isLabel());
-    insertAfter(*begin(), entryMoveGroup_);
+    entryMoveGroup_ = LMoveGroup::New(alloc);
+    if (begin()->isLabel())
+        insertAfter(*begin(), entryMoveGroup_);
+    else
+        insertBefore(*begin(), entryMoveGroup_);
     return entryMoveGroup_;
 }
 
-LMoveGroup *
-LBlock::getExitMoveGroup()
+LMoveGroup*
+LBlock::getExitMoveGroup(TempAllocator& alloc)
 {
     if (exitMoveGroup_)
         return exitMoveGroup_;
-    exitMoveGroup_ = new LMoveGroup;
+    exitMoveGroup_ = LMoveGroup::New(alloc);
     insertBefore(*rbegin(), exitMoveGroup_);
     return exitMoveGroup_;
 }
 
 static size_t
-TotalOperandCount(MResumePoint *mir)
+TotalOperandCount(MResumePoint* mir)
 {
     size_t accum = mir->numOperands();
     while ((mir = mir->caller()))
@@ -106,31 +119,69 @@ TotalOperandCount(MResumePoint *mir)
     return accum;
 }
 
-LSnapshot::LSnapshot(MResumePoint *mir, BailoutKind kind)
-  : numSlots_(TotalOperandCount(mir) * BOX_PIECES),
-    slots_(NULL),
-    mir_(mir),
+LRecoverInfo::LRecoverInfo(TempAllocator& alloc)
+  : instructions_(alloc),
+    recoverOffset_(INVALID_RECOVER_OFFSET)
+{ }
+
+LRecoverInfo*
+LRecoverInfo::New(MIRGenerator* gen, MResumePoint* mir)
+{
+    LRecoverInfo* recoverInfo = new(gen->alloc()) LRecoverInfo(gen->alloc());
+    if (!recoverInfo || !recoverInfo->init(mir))
+        return nullptr;
+
+    IonSpew(IonSpew_Snapshots, "Generating LIR recover info %p from MIR (%p)",
+            (void*)recoverInfo, (void*)mir);
+
+    return recoverInfo;
+}
+
+bool
+LRecoverInfo::init(MResumePoint* rp)
+{
+    MResumePoint* it = rp;
+
+    // Sort operations in the order in which we need to restore the stack. This
+    // implies that outer frames, as well as operations needed to recover the
+    // current frame, are located before the current frame. The inner-most
+    // resume point should be the last element in the list.
+    do {
+        if (!instructions_.append(it))
+            return false;
+        it = it->caller();
+    } while (it);
+
+    Reverse(instructions_.begin(), instructions_.end());
+    MOZ_ASSERT(mir() == rp);
+    return true;
+}
+
+LSnapshot::LSnapshot(LRecoverInfo* recoverInfo, BailoutKind kind)
+  : numSlots_(TotalOperandCount(recoverInfo->mir()) * BOX_PIECES),
+    slots_(nullptr),
+    recoverInfo_(recoverInfo),
     snapshotOffset_(INVALID_SNAPSHOT_OFFSET),
     bailoutId_(INVALID_BAILOUT_ID),
     bailoutKind_(kind)
 { }
 
 bool
-LSnapshot::init(MIRGenerator *gen)
+LSnapshot::init(MIRGenerator* gen)
 {
     slots_ = gen->allocate<LAllocation>(numSlots_);
     return !!slots_;
 }
 
-LSnapshot *
-LSnapshot::New(MIRGenerator *gen, MResumePoint *mir, BailoutKind kind)
+LSnapshot*
+LSnapshot::New(MIRGenerator* gen, LRecoverInfo* recover, BailoutKind kind)
 {
-    LSnapshot *snapshot = new LSnapshot(mir, kind);
-    if (!snapshot->init(gen))
-        return NULL;
+    LSnapshot* snapshot = new(gen->alloc()) LSnapshot(recover, kind);
+    if (!snapshot || !snapshot->init(gen))
+        return nullptr;
 
-    IonSpew(IonSpew_Snapshots, "Generating LIR snapshot %p from MIR (%p)",
-            (void *)snapshot, (void *)mir);
+    IonSpew(IonSpew_Snapshots, "Generating LIR snapshot %p from recover (%p)",
+            (void*)snapshot, (void*)recover);
 
     return snapshot;
 }
@@ -146,29 +197,21 @@ LSnapshot::rewriteRecoveredInput(LUse input)
     }
 }
 
-bool
-LPhi::init(MIRGenerator *gen)
+LPhi*
+LPhi::New(MIRGenerator* gen, MPhi* ins)
 {
-    inputs_ = gen->allocate<LAllocation>(numInputs_);
-    return !!inputs_;
-}
+    LPhi* phi = new (gen->alloc()) LPhi();
+    LAllocation* inputs = gen->allocate<LAllocation>(ins->numOperands());
+    if (!inputs)
+        return nullptr;
 
-LPhi::LPhi(MPhi *mir)
-  : numInputs_(mir->numOperands())
-{
-}
-
-LPhi *
-LPhi::New(MIRGenerator *gen, MPhi *ins)
-{
-    LPhi *phi = new LPhi(ins);
-    if (!phi->init(gen))
-        return NULL;
+    phi->inputs_ = inputs;
+    phi->setMir(ins);
     return phi;
 }
 
 void
-LInstruction::printName(FILE *fp, Opcode op)
+LInstruction::printName(FILE* fp, Opcode op)
 {
     static const char * const names[] =
     {
@@ -176,33 +219,36 @@ LInstruction::printName(FILE *fp, Opcode op)
         LIR_OPCODE_LIST(LIROP)
 #undef LIROP
     };
-    const char *name = names[op];
+    const char* name = names[op];
     size_t len = strlen(name);
     for (size_t i = 0; i < len; i++)
         fprintf(fp, "%c", tolower(name[i]));
 }
 
 void
-LInstruction::printName(FILE *fp)
+LInstruction::printName(FILE* fp)
 {
     printName(fp, op());
 }
 
 static const char * const TypeChars[] =
 {
-    "i",            // INTEGER
+    "g",            // GENERAL
+    "i",            // INT32
     "o",            // OBJECT
-    "f",            // DOUBLE
+    "s",            // SLOTS
+    "f",            // FLOAT32
+    "d",            // DOUBLE
 #ifdef JS_NUNBOX32
     "t",            // TYPE
-    "d"             // PAYLOAD
+    "p"             // PAYLOAD
 #elif JS_PUNBOX64
     "x"             // BOX
 #endif
 };
 
 static void
-PrintDefinition(FILE *fp, const LDefinition &def)
+PrintDefinition(FILE* fp, const LDefinition& def)
 {
     fprintf(fp, "[%s", TypeChars[def.type()]);
     if (def.virtualRegister())
@@ -219,7 +265,7 @@ PrintDefinition(FILE *fp, const LDefinition &def)
 
 #ifdef DEBUG
 static void
-PrintUse(char *buf, size_t size, const LUse *use)
+PrintUse(char* buf, size_t size, const LUse* use)
 {
     switch (use->policy()) {
       case LUse::REGISTER:
@@ -232,12 +278,21 @@ PrintUse(char *buf, size_t size, const LUse *use)
         JS_snprintf(buf, size, "v%d:%s", use->virtualRegister(),
                     Registers::GetName(Registers::Code(use->registerCode())));
         break;
-      default:
+      case LUse::ANY:
+        JS_snprintf(buf, size, "v%d:r?", use->virtualRegister());
+        break;
+      case LUse::KEEPALIVE:
         JS_snprintf(buf, size, "v%d:*", use->virtualRegister());
+        break;
+      case LUse::RECOVERED_INPUT:
+        JS_snprintf(buf, size, "v%d:**", use->virtualRegister());
+        break;
+      default:
+        MOZ_ASSUME_UNREACHABLE("invalid use policy");
     }
 }
 
-const char *
+const char*
 LAllocation::toString() const
 {
     // Not reentrant!
@@ -254,31 +309,30 @@ LAllocation::toString() const
         JS_snprintf(buf, sizeof(buf), "=%s", toFloatReg()->reg().name());
         return buf;
       case LAllocation::STACK_SLOT:
-        JS_snprintf(buf, sizeof(buf), "stack:i%d", toStackSlot()->slot());
+        JS_snprintf(buf, sizeof(buf), "stack:%d", toStackSlot()->slot());
         return buf;
-      case LAllocation::DOUBLE_SLOT:
-        JS_snprintf(buf, sizeof(buf), "stack:d%d", toStackSlot()->slot());
-        return buf;
-      case LAllocation::INT_ARGUMENT:
-        JS_snprintf(buf, sizeof(buf), "arg:%d", toArgument()->index());
-        return buf;
-      case LAllocation::DOUBLE_ARGUMENT:
+      case LAllocation::ARGUMENT_SLOT:
         JS_snprintf(buf, sizeof(buf), "arg:%d", toArgument()->index());
         return buf;
       case LAllocation::USE:
         PrintUse(buf, sizeof(buf), toUse());
         return buf;
       default:
-        JS_NOT_REACHED("what?");
-        return "???";
+        MOZ_ASSUME_UNREACHABLE("what?");
     }
 }
 #endif // DEBUG
 
 void
-LInstruction::printOperands(FILE *fp)
+LAllocation::dump() const
 {
-    for (size_t i = 0; i < numOperands(); i++) {
+    fprintf(stderr, "%s\n", toString());
+}
+
+void
+LInstruction::printOperands(FILE* fp)
+{
+    for (size_t i = 0, e = numOperands(); i < e; i++) {
         fprintf(fp, " (%s)", getOperand(i)->toString());
         if (i != numOperands() - 1)
             fprintf(fp, ",");
@@ -286,7 +340,7 @@ LInstruction::printOperands(FILE *fp)
 }
 
 void
-LInstruction::assignSnapshot(LSnapshot *snapshot)
+LInstruction::assignSnapshot(LSnapshot* snapshot)
 {
     JS_ASSERT(!snapshot_);
     snapshot_ = snapshot;
@@ -295,7 +349,7 @@ LInstruction::assignSnapshot(LSnapshot *snapshot)
     if (IonSpewEnabled(IonSpew_Snapshots)) {
         IonSpewHeader(IonSpew_Snapshots);
         fprintf(IonSpewFile, "Assigning snapshot %p to instruction %p (",
-                (void *)snapshot, (void *)this);
+                (void*)snapshot, (void*)this);
         printName(IonSpewFile);
         fprintf(IonSpewFile, ")\n");
     }
@@ -303,7 +357,7 @@ LInstruction::assignSnapshot(LSnapshot *snapshot)
 }
 
 void
-LInstruction::print(FILE *fp)
+LInstruction::dump(FILE* fp)
 {
     fprintf(fp, "{");
     for (size_t i = 0; i < numDefs(); i++) {
@@ -327,29 +381,36 @@ LInstruction::print(FILE *fp)
         }
         fprintf(fp, ")");
     }
+    fprintf(fp, "\n");
 }
 
 void
-LInstruction::initSafepoint()
+LInstruction::dump()
+{
+    return dump(stderr);
+}
+
+void
+LInstruction::initSafepoint(TempAllocator& alloc)
 {
     JS_ASSERT(!safepoint_);
-    safepoint_ = new LSafepoint();
+    safepoint_ = new(alloc) LSafepoint(alloc);
     JS_ASSERT(safepoint_);
 }
 
 bool
-LMoveGroup::add(LAllocation *from, LAllocation *to)
+LMoveGroup::add(LAllocation* from, LAllocation* to, LDefinition::Type type)
 {
 #ifdef DEBUG
     JS_ASSERT(*from != *to);
     for (size_t i = 0; i < moves_.length(); i++)
         JS_ASSERT(*to != *moves_[i].to());
 #endif
-    return moves_.append(LMove(from, to));
+    return moves_.append(LMove(from, to, type));
 }
 
 bool
-LMoveGroup::addAfter(LAllocation *from, LAllocation *to)
+LMoveGroup::addAfter(LAllocation* from, LAllocation* to, LDefinition::Type type)
 {
     // Transform the operands to this move so that performing the result
     // simultaneously with existing moves in the group will have the same
@@ -367,19 +428,19 @@ LMoveGroup::addAfter(LAllocation *from, LAllocation *to)
 
     for (size_t i = 0; i < moves_.length(); i++) {
         if (*to == *moves_[i].to()) {
-            moves_[i] = LMove(from, to);
+            moves_[i] = LMove(from, to, type);
             return true;
         }
     }
 
-    return add(from, to);
+    return add(from, to, type);
 }
 
 void
-LMoveGroup::printOperands(FILE *fp)
+LMoveGroup::printOperands(FILE* fp)
 {
     for (size_t i = 0; i < numMoves(); i++) {
-        const LMove &move = getMove(i);
+        const LMove& move = getMove(i);
         // Use two printfs, as LAllocation::toString is not reentrant.
         fprintf(fp, "[%s", move.from()->toString());
         fprintf(fp, " -> %s]", move.to()->toString());

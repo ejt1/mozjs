@@ -4,7 +4,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include "RegisterAllocator.h"
+#include "jit/RegisterAllocator.h"
 
 using namespace js;
 using namespace js::jit;
@@ -19,38 +19,38 @@ AllocationIntegrityState::record()
     if (!instructions.appendN(InstructionInfo(), graph.numInstructions()))
         return false;
 
-    if (!virtualRegisters.appendN((LDefinition *)NULL, graph.numVirtualRegisters()))
+    if (!virtualRegisters.appendN((LDefinition*)nullptr, graph.numVirtualRegisters()))
         return false;
 
     if (!blocks.reserve(graph.numBlocks()))
         return false;
     for (size_t i = 0; i < graph.numBlocks(); i++) {
         blocks.infallibleAppend(BlockInfo());
-        LBlock *block = graph.getBlock(i);
+        LBlock* block = graph.getBlock(i);
         JS_ASSERT(block->mir()->id() == i);
 
-        BlockInfo &blockInfo = blocks[i];
+        BlockInfo& blockInfo = blocks[i];
         if (!blockInfo.phis.reserve(block->numPhis()))
             return false;
 
         for (size_t j = 0; j < block->numPhis(); j++) {
             blockInfo.phis.infallibleAppend(InstructionInfo());
-            InstructionInfo &info = blockInfo.phis[j];
-            LPhi *phi = block->getPhi(j);
+            InstructionInfo& info = blockInfo.phis[j];
+            LPhi* phi = block->getPhi(j);
             JS_ASSERT(phi->numDefs() == 1);
             uint32_t vreg = phi->getDef(0)->virtualRegister();
             virtualRegisters[vreg] = phi->getDef(0);
             if (!info.outputs.append(*phi->getDef(0)))
                 return false;
-            for (size_t k = 0; k < phi->numOperands(); k++) {
+            for (size_t k = 0, kend = phi->numOperands(); k < kend; k++) {
                 if (!info.inputs.append(*phi->getOperand(k)))
                     return false;
             }
         }
 
         for (LInstructionIterator iter = block->begin(); iter != block->end(); iter++) {
-            LInstruction *ins = *iter;
-            InstructionInfo &info = instructions[ins->id()];
+            LInstruction* ins = *iter;
+            InstructionInfo& info = instructions[ins->id()];
 
             for (size_t k = 0; k < ins->numTemps(); k++) {
                 uint32_t vreg = ins->getTemp(k)->virtualRegister();
@@ -84,17 +84,17 @@ AllocationIntegrityState::check(bool populateSafepoints)
         dump();
 
     for (size_t blockIndex = 0; blockIndex < graph.numBlocks(); blockIndex++) {
-        LBlock *block = graph.getBlock(blockIndex);
+        LBlock* block = graph.getBlock(blockIndex);
 
         // Check that all instruction inputs and outputs have been assigned an allocation.
         for (LInstructionIterator iter = block->begin(); iter != block->end(); iter++) {
-            LInstruction *ins = *iter;
+            LInstruction* ins = *iter;
 
             for (LInstruction::InputIterator alloc(*ins); alloc.more(); alloc.next())
                 JS_ASSERT(!alloc->isUse());
 
             for (size_t i = 0; i < ins->numDefs(); i++) {
-                LDefinition *def = ins->getDef(i);
+                LDefinition* def = ins->getDef(i);
                 JS_ASSERT_IF(def->policy() != LDefinition::PASSTHROUGH, !def->output()->isUse());
 
                 LDefinition oldDef = instructions[ins->id()].outputs[i];
@@ -103,7 +103,7 @@ AllocationIntegrityState::check(bool populateSafepoints)
             }
 
             for (size_t i = 0; i < ins->numTemps(); i++) {
-                LDefinition *temp = ins->getTemp(i);
+                LDefinition* temp = ins->getTemp(i);
                 JS_ASSERT_IF(!temp->isBogusTemp(), temp->output()->isRegister());
 
                 LDefinition oldTemp = instructions[ins->id()].temps[i];
@@ -124,16 +124,16 @@ AllocationIntegrityState::check(bool populateSafepoints)
     // backward through the script, along all paths to the value's virtual
     // register's definition.
     for (size_t blockIndex = 0; blockIndex < graph.numBlocks(); blockIndex++) {
-        LBlock *block = graph.getBlock(blockIndex);
+        LBlock* block = graph.getBlock(blockIndex);
         for (LInstructionIterator iter = block->begin(); iter != block->end(); iter++) {
-            LInstruction *ins = *iter;
-            const InstructionInfo &info = instructions[ins->id()];
+            LInstruction* ins = *iter;
+            const InstructionInfo& info = instructions[ins->id()];
 
-            LSafepoint *safepoint = ins->safepoint();
+            LSafepoint* safepoint = ins->safepoint();
             if (safepoint) {
                 for (size_t i = 0; i < ins->numTemps(); i++) {
                     uint32_t vreg = info.temps[i].virtualRegister();
-                    LAllocation *alloc = ins->getTemp(i)->output();
+                    LAllocation* alloc = ins->getTemp(i)->output();
                     if (!checkSafepointAllocation(ins, vreg, *alloc, populateSafepoints))
                         return false;
                 }
@@ -162,8 +162,7 @@ AllocationIntegrityState::check(bool populateSafepoints)
                 checkIntegrity(block, *riter, vreg, **alloc, populateSafepoints);
 
                 while (!worklist.empty()) {
-                    IntegrityItem item = worklist.back();
-                    worklist.popBack();
+                    IntegrityItem item = worklist.popCopy();
                     checkIntegrity(item.block, *item.block->rbegin(), item.vreg, item.alloc, populateSafepoints);
                 }
             }
@@ -174,7 +173,7 @@ AllocationIntegrityState::check(bool populateSafepoints)
 }
 
 bool
-AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
+AllocationIntegrityState::checkIntegrity(LBlock* block, LInstruction* ins,
                                          uint32_t vreg, LAllocation alloc, bool populateSafepoints)
 {
     for (LInstructionReverseIterator iter(block->rbegin(ins)); iter != block->rend(); iter++) {
@@ -184,7 +183,7 @@ AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
         // a move group are considered to happen simultaneously, so stop after
         // the first matching move is found.
         if (ins->isMoveGroup()) {
-            LMoveGroup *group = ins->toMoveGroup();
+            LMoveGroup* group = ins->toMoveGroup();
             for (int i = group->numMoves() - 1; i >= 0; i--) {
                 if (*group->getMove(i).to() == alloc) {
                     alloc = *group->getMove(i).from();
@@ -193,14 +192,14 @@ AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
             }
         }
 
-        const InstructionInfo &info = instructions[ins->id()];
+        const InstructionInfo& info = instructions[ins->id()];
 
         // Make sure the physical location being tracked is not clobbered by
         // another instruction, and that if the originating vreg definition is
         // found that it is writing to the tracked location.
 
         for (size_t i = 0; i < ins->numDefs(); i++) {
-            LDefinition *def = ins->getDef(i);
+            LDefinition* def = ins->getDef(i);
             if (def->policy() == LDefinition::PASSTHROUGH)
                 continue;
             if (info.outputs[i].virtualRegister() == vreg) {
@@ -214,7 +213,7 @@ AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
         }
 
         for (size_t i = 0; i < ins->numTemps(); i++) {
-            LDefinition *temp = ins->getTemp(i);
+            LDefinition* temp = ins->getTemp(i);
             if (!temp->isBogusTemp())
                 JS_ASSERT(*temp->output() != alloc);
         }
@@ -230,12 +229,12 @@ AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
     // inputs as it is not guaranteed the register allocator filled in physical
     // allocations for the inputs and outputs of the phis.
     for (size_t i = 0; i < block->numPhis(); i++) {
-        InstructionInfo &info = blocks[block->mir()->id()].phis[i];
-        LPhi *phi = block->getPhi(i);
+        const InstructionInfo& info = blocks[block->mir()->id()].phis[i];
+        LPhi* phi = block->getPhi(i);
         if (info.outputs[0].virtualRegister() == vreg) {
-            for (size_t j = 0; j < phi->numOperands(); j++) {
+            for (size_t j = 0, jend = phi->numOperands(); j < jend; j++) {
                 uint32_t newvreg = info.inputs[j].toUse()->virtualRegister();
-                LBlock *predecessor = graph.getBlock(block->mir()->getPredecessor(j)->id());
+                LBlock* predecessor = graph.getBlock(block->mir()->getPredecessor(j)->id());
                 if (!addPredecessor(predecessor, newvreg, alloc))
                     return false;
             }
@@ -245,8 +244,8 @@ AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
 
     // No phi which defined the vreg we are tracking, follow back through all
     // predecessors with the existing vreg.
-    for (size_t i = 0; i < block->mir()->numPredecessors(); i++) {
-        LBlock *predecessor = graph.getBlock(block->mir()->getPredecessor(i)->id());
+    for (size_t i = 0, iend = block->mir()->numPredecessors(); i < iend; i++) {
+        LBlock* predecessor = graph.getBlock(block->mir()->getPredecessor(i)->id());
         if (!addPredecessor(predecessor, vreg, alloc))
             return false;
     }
@@ -255,11 +254,11 @@ AllocationIntegrityState::checkIntegrity(LBlock *block, LInstruction *ins,
 }
 
 bool
-AllocationIntegrityState::checkSafepointAllocation(LInstruction *ins,
+AllocationIntegrityState::checkSafepointAllocation(LInstruction* ins,
                                                    uint32_t vreg, LAllocation alloc,
                                                    bool populateSafepoints)
 {
-    LSafepoint *safepoint = ins->safepoint();
+    LSafepoint* safepoint = ins->safepoint();
     JS_ASSERT(safepoint);
 
     if (ins->isCall() && alloc.isRegister())
@@ -285,6 +284,15 @@ AllocationIntegrityState::checkSafepointAllocation(LInstruction *ins,
                 return false;
         }
         JS_ASSERT(safepoint->hasGcPointer(alloc));
+        break;
+      case LDefinition::SLOTS:
+        if (populateSafepoints) {
+            IonSpew(IonSpew_RegAlloc, "Safepoint slots v%u i%u %s",
+                    vreg, ins->id(), alloc.toString());
+            if (!safepoint->addSlotsOrElementsPointer(alloc))
+                return false;
+        }
+        JS_ASSERT(safepoint->hasSlotsOrElementsPointer(alloc));
         break;
 #ifdef JS_NUNBOX32
       // Do not assert that safepoint information for nunbox types is complete,
@@ -327,7 +335,7 @@ AllocationIntegrityState::checkSafepointAllocation(LInstruction *ins,
 }
 
 bool
-AllocationIntegrityState::addPredecessor(LBlock *block, uint32_t vreg, LAllocation alloc)
+AllocationIntegrityState::addPredecessor(LBlock* block, uint32_t vreg, LAllocation alloc)
 {
     // There is no need to reanalyze if we have already seen this predecessor.
     // We share the seen allocations across analysis of each use, as there will
@@ -351,71 +359,79 @@ void
 AllocationIntegrityState::dump()
 {
 #ifdef DEBUG
-    printf("Register Allocation:\n");
+    fprintf(stderr, "Register Allocation:\n");
 
     for (size_t blockIndex = 0; blockIndex < graph.numBlocks(); blockIndex++) {
-        LBlock *block = graph.getBlock(blockIndex);
-        MBasicBlock *mir = block->mir();
+        LBlock* block = graph.getBlock(blockIndex);
+        MBasicBlock* mir = block->mir();
 
-        printf("\nBlock %lu", blockIndex);
+        fprintf(stderr, "\nBlock %lu", static_cast<unsigned long>(blockIndex));
         for (size_t i = 0; i < mir->numSuccessors(); i++)
-            printf(" [successor %u]", mir->getSuccessor(i)->id());
-        printf("\n");
+            fprintf(stderr, " [successor %u]", mir->getSuccessor(i)->id());
+        fprintf(stderr, "\n");
 
         for (size_t i = 0; i < block->numPhis(); i++) {
-            InstructionInfo &info = blocks[blockIndex].phis[i];
-            LPhi *phi = block->getPhi(i);
+            const InstructionInfo& info = blocks[blockIndex].phis[i];
+            LPhi* phi = block->getPhi(i);
+            CodePosition output(phi->id(), CodePosition::OUTPUT);
 
-            printf("Phi v%u <-", info.outputs[0].virtualRegister());
+            // Don't print the inputOf for phi nodes, since it's never used.
+            fprintf(stderr, "[,%u Phi [def v%u %s] <-",
+                    output.pos(),
+                    info.outputs[0].virtualRegister(),
+                    phi->getDef(0)->output()->toString());
             for (size_t j = 0; j < phi->numOperands(); j++)
-                printf(" %s", info.inputs[j].toString());
-            printf("\n");
+                fprintf(stderr, " %s", info.inputs[j].toString());
+            fprintf(stderr, "]\n");
         }
 
         for (LInstructionIterator iter = block->begin(); iter != block->end(); iter++) {
-            LInstruction *ins = *iter;
-            InstructionInfo &info = instructions[ins->id()];
+            LInstruction* ins = *iter;
+            const InstructionInfo& info = instructions[ins->id()];
 
             CodePosition input(ins->id(), CodePosition::INPUT);
             CodePosition output(ins->id(), CodePosition::OUTPUT);
 
-            printf("[%u,%u %s]", input.pos(), output.pos(), ins->opName());
+            fprintf(stderr, "[");
+            if (input != CodePosition::MIN)
+                fprintf(stderr, "%u,%u ", input.pos(), output.pos());
+            fprintf(stderr, "%s]", ins->opName());
 
             if (ins->isMoveGroup()) {
-                LMoveGroup *group = ins->toMoveGroup();
+                LMoveGroup* group = ins->toMoveGroup();
                 for (int i = group->numMoves() - 1; i >= 0; i--) {
                     // Use two printfs, as LAllocation::toString is not reentant.
-                    printf(" [%s", group->getMove(i).from()->toString());
-                    printf(" -> %s]", group->getMove(i).to()->toString());
+                    fprintf(stderr, " [%s", group->getMove(i).from()->toString());
+                    fprintf(stderr, " -> %s]", group->getMove(i).to()->toString());
                 }
-                printf("\n");
+                fprintf(stderr, "\n");
                 continue;
             }
 
             for (size_t i = 0; i < ins->numTemps(); i++) {
-                LDefinition *temp = ins->getTemp(i);
+                LDefinition* temp = ins->getTemp(i);
                 if (!temp->isBogusTemp())
-                    printf(" [temp v%u %s]", info.temps[i].virtualRegister(),
+                    fprintf(stderr, " [temp v%u %s]", info.temps[i].virtualRegister(),
                            temp->output()->toString());
             }
 
             for (size_t i = 0; i < ins->numDefs(); i++) {
-                LDefinition *def = ins->getDef(i);
-                printf(" [def v%u %s]", info.outputs[i].virtualRegister(),
+                LDefinition* def = ins->getDef(i);
+                fprintf(stderr, " [def v%u %s]", info.outputs[i].virtualRegister(),
                        def->output()->toString());
             }
 
             size_t index = 0;
             for (LInstruction::InputIterator alloc(*ins); alloc.more(); alloc.next()) {
-                printf(" [use %s", info.inputs[index++].toString());
-                printf(" %s]", alloc->toString());
+                fprintf(stderr, " [use %s", info.inputs[index++].toString());
+                fprintf(stderr, " %s]", alloc->toString());
             }
 
-            printf("\n");
+            fprintf(stderr, "\n");
         }
     }
 
-    printf("\nIntermediate Allocations:\n\n");
+    fprintf(stderr, "\nIntermediate Allocations:\n\n");
 
     // Print discovered allocations at the ends of blocks, in the order they
     // were discovered.
@@ -430,11 +446,11 @@ AllocationIntegrityState::dump()
 
     for (size_t i = 0; i < seenOrdered.length(); i++) {
         IntegrityItem item = seenOrdered[i];
-        printf("block %u reg v%u alloc %s\n",
+        fprintf(stderr, "block %u reg v%u alloc %s\n",
                item.block->mir()->id(), item.vreg, item.alloc.toString());
     }
 
-    printf("\n");
+    fprintf(stderr, "\n");
 #endif
 }
 
@@ -444,15 +460,15 @@ const CodePosition CodePosition::MIN(0);
 bool
 RegisterAllocator::init()
 {
-    if (!insData.init(lir->mir(), graph.numInstructions()))
+    if (!insData.init(mir, graph.numInstructions()))
         return false;
 
     for (size_t i = 0; i < graph.numBlocks(); i++) {
-        LBlock *block = graph.getBlock(i);
+        LBlock* block = graph.getBlock(i);
         for (LInstructionIterator ins = block->begin(); ins != block->end(); ins++)
             insData[*ins].init(*ins, block);
         for (size_t j = 0; j < block->numPhis(); j++) {
-            LPhi *phi = block->getPhi(j);
+            LPhi* phi = block->getPhi(j);
             insData[phi].init(phi, block);
         }
     }
@@ -460,37 +476,37 @@ RegisterAllocator::init()
     return true;
 }
 
-LMoveGroup *
+LMoveGroup*
 RegisterAllocator::getInputMoveGroup(uint32_t ins)
 {
-    InstructionData *data = &insData[ins];
+    InstructionData* data = &insData[ins];
     JS_ASSERT(!data->ins()->isPhi());
     JS_ASSERT(!data->ins()->isLabel());
 
     if (data->inputMoves())
         return data->inputMoves();
 
-    LMoveGroup *moves = new LMoveGroup;
+    LMoveGroup* moves = LMoveGroup::New(alloc());
     data->setInputMoves(moves);
     data->block()->insertBefore(data->ins(), moves);
 
     return moves;
 }
 
-LMoveGroup *
+LMoveGroup*
 RegisterAllocator::getMoveGroupAfter(uint32_t ins)
 {
-    InstructionData *data = &insData[ins];
+    InstructionData* data = &insData[ins];
     JS_ASSERT(!data->ins()->isPhi());
 
     if (data->movesAfter())
         return data->movesAfter();
 
-    LMoveGroup *moves = new LMoveGroup;
+    LMoveGroup* moves = LMoveGroup::New(alloc());
     data->setMovesAfter(moves);
 
     if (data->ins()->isLabel())
-        data->block()->insertAfter(data->block()->getEntryMoveGroup(), moves);
+        data->block()->insertAfter(data->block()->getEntryMoveGroup(alloc()), moves);
     else
         data->block()->insertAfter(data->ins(), moves);
     return moves;

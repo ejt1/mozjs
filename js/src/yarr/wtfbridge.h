@@ -14,13 +14,12 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include "jscntxt.h"
 #include "jsstr.h"
-#include "jsprvtd.h"
 #include "vm/String.h"
 #include "assembler/wtf/Platform.h"
 #include "assembler/jit/ExecutableAllocator.h"
-#include "CheckedArithmetic.h"
-#include "js/TemplateLib.h"
+#include "yarr/CheckedArithmetic.h"
 
 namespace JSC { namespace Yarr {
 
@@ -51,73 +50,72 @@ class RefCounted {
 
 template<typename T>
 class RefPtr {
-    T *ptr;
+    T* ptr;
   public:
-    RefPtr(T *p) { ptr = p; }
+    RefPtr(T* p) { ptr = p; }
     operator bool() const { return ptr != NULL; }
-    const T *operator ->() const { return ptr; }
-    T *get() { return ptr; }
+    const T* operator ->() const { return ptr; }
+    T* get() { return ptr; }
 };
 
 template<typename T>
 class PassRefPtr {
-    T *ptr;
+    T* ptr;
   public:
-    PassRefPtr(T *p) { ptr = p; }
+    PassRefPtr(T* p) { ptr = p; }
     operator T*() { return ptr; }
 };
 
 template<typename T>
 class PassOwnPtr {
-    T *ptr;
+    T* ptr;
   public:
-    PassOwnPtr(T *p) { ptr = p; }
+    PassOwnPtr(T* p) { ptr = p; }
 
-    T *get() { return ptr; }
+    T* get() { return ptr; }
 };
 
 template<typename T>
 class OwnPtr {
-    T *ptr;
+    T* ptr;
   public:
     OwnPtr() : ptr(NULL) { }
     OwnPtr(PassOwnPtr<T> p) : ptr(p.get()) { }
 
     ~OwnPtr() {
-        if (ptr)
-            js_delete(ptr);
+        js_delete(ptr);
     }
 
-    OwnPtr<T> &operator=(PassOwnPtr<T> p) {
+    OwnPtr<T>& operator=(PassOwnPtr<T> p) {
         ptr = p.get();
         return *this;
     }
 
-    T *operator ->() { return ptr; }
+    T* operator ->() { return ptr; }
 
-    T *get() { return ptr; }
+    T* get() { return ptr; }
 
-    T *release() {
-        T *result = ptr;
+    T* release() {
+        T* result = ptr;
         ptr = NULL;
         return result;
     }
 };
 
 template<typename T>
-PassRefPtr<T> adoptRef(T *p) { return PassRefPtr<T>(p); }
+PassRefPtr<T> adoptRef(T* p) { return PassRefPtr<T>(p); }
 
 template<typename T>
-PassOwnPtr<T> adoptPtr(T *p) { return PassOwnPtr<T>(p); }
+PassOwnPtr<T> adoptPtr(T* p) { return PassOwnPtr<T>(p); }
 
 // Dummy wrapper.
 #define WTF_MAKE_FAST_ALLOCATED void make_fast_allocated_()
 
 template<typename T>
 class Ref {
-    T &val;
+    T& val;
   public:
-    Ref(T &val) : val(val) { }
+    Ref(T& val) : val(val) { }
     operator T&() const { return val; }
 };
 
@@ -132,7 +130,7 @@ class Vector {
   public:
     Vector() {}
 
-    Vector(const Vector &v) {
+    Vector(const Vector& v) {
         append(v);
     }
 
@@ -140,23 +138,23 @@ class Vector {
         return impl.length();
     }
 
-    T &operator[](size_t i) {
+    T& operator[](size_t i) {
         return impl[i];
     }
 
-    const T &operator[](size_t i) const {
+    const T& operator[](size_t i) const {
         return impl[i];
     }
 
-    T &at(size_t i) {
+    T& at(size_t i) {
         return impl[i];
     }
 
-    const T *begin() const {
+    const T* begin() const {
         return impl.begin();
     }
 
-    T &last() {
+    T& last() {
         return impl.back();
     }
 
@@ -165,20 +163,20 @@ class Vector {
     }
 
     template <typename U>
-    void append(const U &u) {
+    void append(const U& u) {
         if (!impl.append(static_cast<T>(u)))
-            MOZ_CRASH();
+            js::CrashAtUnhandlableOOM("Yarr");
     }
 
     template <size_t M>
-    void append(const Vector<T,M> &v) {
-        if (!impl.append(v.impl))
-            MOZ_CRASH();
+    void append(const Vector<T,M>& v) {
+        if (!impl.appendAll(v.impl))
+            js::CrashAtUnhandlableOOM("Yarr");
     }
 
     void insert(size_t i, const T& t) {
         if (!impl.insert(&impl[i], t))
-            MOZ_CRASH();
+            js::CrashAtUnhandlableOOM("Yarr");
     }
 
     void remove(size_t i) {
@@ -192,15 +190,15 @@ class Vector {
     void shrink(size_t newLength) {
         JS_ASSERT(newLength <= impl.length());
         if (!impl.resize(newLength))
-            MOZ_CRASH();
+            js::CrashAtUnhandlableOOM("Yarr");
     }
 
-    void swap(Vector &other) {
+    void swap(Vector& other) {
         impl.swap(other.impl);
     }
 
     void deleteAllValues() {
-        for (T *p = impl.begin(); p != impl.end(); ++p)
+        for (T* p = impl.begin(); p != impl.end(); ++p)
             js_delete(*p);
     }
 
@@ -212,7 +210,7 @@ class Vector {
 template<typename T>
 class Vector<OwnPtr<T> > {
   public:
-    js::Vector<T *, 0, js::SystemAllocPolicy> impl;
+    js::Vector<T*, 0, js::SystemAllocPolicy> impl;
   public:
     Vector() {}
 
@@ -220,9 +218,9 @@ class Vector<OwnPtr<T> > {
         return impl.length();
     }
 
-    void append(T *t) {
+    void append(T* t) {
         if (!impl.append(t))
-            MOZ_CRASH();
+            js::CrashAtUnhandlableOOM("Yarr");
     }
 
     PassOwnPtr<T> operator[](size_t i) {
@@ -230,25 +228,25 @@ class Vector<OwnPtr<T> > {
     }
 
     void clear() {
-        for (T **p = impl.begin(); p != impl.end(); ++p)
+        for (T** p = impl.begin(); p != impl.end(); ++p)
             delete_(*p);
         return impl.clear();
     }
 
     void reserve(size_t capacity) {
         if (!impl.reserve(capacity))
-            MOZ_CRASH();
+            js::CrashAtUnhandlableOOM("Yarr");
     }
 };
 
 template <typename T, size_t N>
 inline void
-deleteAllValues(Vector<T, N> &v) {
+deleteAllValues(Vector<T, N>& v) {
     v.deleteAllValues();
 }
 
 static inline void
-dataLog(const char *fmt, ...)
+dataLogF(const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -263,9 +261,9 @@ dataLog(const char *fmt, ...)
  */
 class JSGlobalData {
   public:
-    ExecutableAllocator *regexAllocator;
+    ExecutableAllocator* regexAllocator;
 
-    JSGlobalData(ExecutableAllocator *regexAllocator)
+    JSGlobalData(ExecutableAllocator* regexAllocator)
      : regexAllocator(regexAllocator) { }
 };
 
@@ -277,10 +275,61 @@ class JSGlobalData {
   */
 #define UNUSED_PARAM(e)
 
+/*
+ * Like SpiderMonkey's allocation templates, but with more crashing.
+ */
+template <class T>
+T* newOrCrash()
+{
+    T* t = js_new<T>();
+    if (!t)
+        js::CrashAtUnhandlableOOM("Yarr");
+    return t;
+}
+
+template <class T, class P1>
+T* newOrCrash(P1&& p1)
+{
+    T* t = js_new<T>(mozilla::Forward<P1>(p1));
+    if (!t)
+        js::CrashAtUnhandlableOOM("Yarr");
+    return t;
+}
+
+template <class T, class P1, class P2>
+T* newOrCrash(P1&& p1, P2&& p2)
+{
+    T* t = js_new<T>(mozilla::Forward<P1>(p1), mozilla::Forward<P2>(p2));
+    if (!t)
+        js::CrashAtUnhandlableOOM("Yarr");
+    return t;
+}
+
+template <class T, class P1, class P2, class P3>
+T* newOrCrash(P1&& p1, P2&& p2, P3&& p3)
+{
+    T* t = js_new<T>(mozilla::Forward<P1>(p1), mozilla::Forward<P2>(p2), mozilla::Forward<P3>(p3));
+    if (!t)
+        js::CrashAtUnhandlableOOM("Yarr");
+    return t;
+}
+
+template <class T, class P1, class P2, class P3, class P4>
+T* newOrCrash(P1&& p1, P2&& p2, P3&& p3, P4&& p4)
+{
+    T* t = js_new<T>(mozilla::Forward<P1>(p1),
+                     mozilla::Forward<P2>(p2),
+                     mozilla::Forward<P3>(p3),
+                     mozilla::Forward<P4>(p4));
+    if (!t)
+        js::CrashAtUnhandlableOOM("Yarr");
+    return t;
+}
+
 } /* namespace Yarr */
 
 /*
- * Replacements for std:: functions used in Yarr. We put them in 
+ * Replacements for std:: functions used in Yarr. We put them in
  * namespace JSC::std so that they can still be called as std::X
  * in Yarr.
  */
@@ -313,7 +362,7 @@ max(T t1, T t2)
 
 template<typename T>
 inline void
-swap(T &t1, T &t2)
+swap(T& t1, T& t2)
 {
     T tmp = t1;
     t1 = t2;

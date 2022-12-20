@@ -7,7 +7,8 @@
 #ifndef prmjtime_h
 #define prmjtime_h
 
-#include <time.h>
+#include <stddef.h>
+#include <stdint.h>
 
 /*
  * Broken down form of 64 bit time value.
@@ -43,6 +44,6 @@ PRMJ_NowShutdown(void);
 
 /* Format a time value into a buffer. Same semantics as strftime() */
 extern size_t
-PRMJ_FormatTime(char *buf, int buflen, const char *fmt, PRMJTime *tm);
+PRMJ_FormatTime(char* buf, int buflen, const char* fmt, PRMJTime* tm);
 
 #endif /* prmjtime_h */

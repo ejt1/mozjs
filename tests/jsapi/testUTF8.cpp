@@ -5,17 +5,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include "tests.h"
 #include "jsapi.h"
 #include "jsstr.h"
+
 #include "js/CharacterEncoding.h"
+#include "tests.h"
 
 BEGIN_TEST(testUTF8_badUTF8)
 {
     static const char badUTF8[] = "...\xC0...";
-    JSString *str = JS_NewStringCopyZ(cx, badUTF8);
+    JSString* str = JS_NewStringCopyZ(cx, badUTF8);
     CHECK(str);
-    const jschar *chars = JS_GetStringCharsZ(cx, str);
+    const jschar* chars = JS_GetStringCharsZ(cx, str);
     CHECK(chars);
     CHECK(chars[3] == 0x00C0);
     return true;
@@ -25,9 +26,9 @@ END_TEST(testUTF8_badUTF8)
 BEGIN_TEST(testUTF8_bigUTF8)
 {
     static const char bigUTF8[] = "...\xFB\xBF\xBF\xBF\xBF...";
-    JSString *str = JS_NewStringCopyZ(cx, bigUTF8);
+    JSString* str = JS_NewStringCopyZ(cx, bigUTF8);
     CHECK(str);
-    const jschar *chars = JS_GetStringCharsZ(cx, str);
+    const jschar* chars = JS_GetStringCharsZ(cx, str);
     CHECK(chars);
     CHECK(chars[3] == 0x00FB);
     return true;

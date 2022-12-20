@@ -2,19 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "js/OldDebugAPI.h"
 #include "tests.h"
-#include "jsdbgapi.h"
 
-JSPrincipals *sOriginPrincipalsInErrorReporter = NULL;
-
-static void
-ErrorReporter(JSContext *cx, const char *message, JSErrorReport *report)
-{
-    sOriginPrincipalsInErrorReporter = report->originPrincipals;
-}
-
-JSPrincipals prin1 = { 1 };
-JSPrincipals prin2 = { 1 };
+static JSPrincipals* sOriginPrincipalsInErrorReporter = nullptr;
+static TestJSPrincipals prin1(1);
+static TestJSPrincipals prin2(1);
 
 BEGIN_TEST(testOriginPrincipals)
 {
@@ -51,30 +44,39 @@ BEGIN_TEST(testOriginPrincipals)
     return true;
 }
 
+static void
+ErrorReporter(JSContext* cx, const char* message, JSErrorReport* report)
+{
+    sOriginPrincipalsInErrorReporter = report->originPrincipals;
+}
+
 bool
-eval(const char *asciiChars, JSPrincipals *principals, JSPrincipals *originPrincipals, jsval *rval)
+eval(const char* asciiChars, JSPrincipals* principals, JSPrincipals* originPrincipals, JS::MutableHandleValue rval)
 {
     size_t len = strlen(asciiChars);
-    jschar *chars = new jschar[len+1];
+    jschar* chars = new jschar[len+1];
     for (size_t i = 0; i < len; ++i)
         chars[i] = asciiChars[i];
     chars[len] = 0;
 
-    JS::RootedObject global(cx, JS_NewGlobalObject(cx, getGlobalClass(), principals));
+    JS::RootedObject global(cx, JS_NewGlobalObject(cx, getGlobalClass(), principals, JS::FireOnNewGlobalHook));
     CHECK(global);
     JSAutoCompartment ac(cx, global);
     CHECK(JS_InitStandardClasses(cx, global));
-    bool ok = JS_EvaluateUCScriptForPrincipalsVersionOrigin(cx, global,
-                                                            principals,
-                                                            originPrincipals,
-                                                            chars, len, "", 0, rval,
-                                                            JSVERSION_DEFAULT);
+
+
+    JS::CompileOptions options(cx);
+    options.setOriginPrincipals(originPrincipals)
+           .setFileAndLine("", 0);
+
+    bool ok = JS::Evaluate(cx, global, options, chars, len, rval);
+
     delete[] chars;
     return ok;
 }
 
 bool
-testOuter(const char *asciiChars)
+testOuter(const char* asciiChars)
 {
     CHECK(testInner(asciiChars, &prin1, &prin1));
     CHECK(testInner(asciiChars, &prin1, &prin2));
@@ -82,12 +84,13 @@ testOuter(const char *asciiChars)
 }
 
 bool
-testInner(const char *asciiChars, JSPrincipals *principal, JSPrincipals *originPrincipal)
+testInner(const char* asciiChars, JSPrincipals* principal, JSPrincipals* originPrincipal)
 {
     JS::RootedValue rval(cx);
-    CHECK(eval(asciiChars, principal, originPrincipal, rval.address()));
+    CHECK(eval(asciiChars, principal, originPrincipal, &rval));
 
-    JSScript *script = JS_GetFunctionScript(cx, &rval.toObject().as<JSFunction>());
+    JS::RootedFunction fun(cx, &rval.toObject().as<JSFunction>());
+    JSScript* script = JS_GetFunctionScript(cx, fun);
     CHECK(JS_GetScriptPrincipals(script) == principal);
     CHECK(JS_GetScriptOriginPrincipals(script) == originPrincipal);
 
@@ -95,9 +98,9 @@ testInner(const char *asciiChars, JSPrincipals *principal, JSPrincipals *originP
 }
 
 bool
-testError(const char *asciiChars)
+testError(const char* asciiChars)
 {
-    jsval rval;
+    JS::RootedValue rval(cx);
     CHECK(!eval(asciiChars, &prin1, &prin2 /* = originPrincipals */, &rval));
     CHECK(JS_ReportPendingException(cx));
     CHECK(sOriginPrincipalsInErrorReporter == &prin2);

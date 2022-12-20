@@ -9,7 +9,9 @@ set(MFBT_SRCS
   src/double-conversion/fast-dtoa.cc
   src/double-conversion/fixed-dtoa.cc
   src/double-conversion/strtod.cc
-
+  
+  #src/mozilla/Compression.cpp
+  src/mozilla/FloatingPoint.cpp
   src/mozilla/HashFunctions.cpp
   src/mozilla/Poison.cpp
   src/mozilla/SHA1.cpp)
@@ -28,42 +30,69 @@ install(TARGETS mfbt
   DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
 
 set(MFBT_PUBLIC_HDRS
+  src/mozilla/Alignment.h
+  src/mozilla/AllocPolicy.h
+  src/mozilla/Array.h
+  src/mozilla/ArrayUtils.h
   src/mozilla/Assertions.h
   src/mozilla/Atomics.h
   src/mozilla/Attributes.h
+  src/mozilla/BinarySearch.h
   src/mozilla/BloomFilter.h
   src/mozilla/Casting.h
+  src/mozilla/ChaosMode.h
   src/mozilla/Char16.h
   src/mozilla/CheckedInt.h
   src/mozilla/Compiler.h
+  src/mozilla/Compression.h
   src/mozilla/Constants.h
   src/mozilla/DebugOnly.h
   src/mozilla/Endian.h
+  src/mozilla/EnumeratedArray.h
   src/mozilla/EnumSet.h
   src/mozilla/FloatingPoint.h
   src/mozilla/GuardObjects.h
   src/mozilla/HashFunctions.h
+  src/mozilla/IntegerPrintfMacros.h
+  src/mozilla/IntegerTypeTraits.h
   src/mozilla/Likely.h
   src/mozilla/LinkedList.h
+  src/mozilla/MacroArgs.h
+  src/mozilla/MacroForEach.h
   src/mozilla/MathAlgorithms.h
+  src/mozilla/Maybe.h
   src/mozilla/MemoryChecking.h
-  src/mozilla/MSStdInt.h
+  src/mozilla/MemoryReporting.h
+  src/mozilla/Move.h
+  src/mozilla/MSIntTypes.h
   src/mozilla/NullPtr.h
+  src/mozilla/NumericLimits.h
   src/mozilla/PodOperations.h
   src/mozilla/Poison.h
   src/mozilla/Range.h
   src/mozilla/RangedPtr.h
+  src/mozilla/ReentrancyGuard.h
+  src/mozilla/RefCountType.h
   src/mozilla/RefPtr.h
+  src/mozilla/RollingMean.h
   src/mozilla/Scoped.h
   src/mozilla/SHA1.h
   src/mozilla/SplayTree.h
-  src/mozilla/StandardInteger.h
+  src/mozilla/TemplateLib.h
   src/mozilla/ThreadLocal.h
   src/mozilla/TypedEnum.h
+  src/mozilla/TypedEnumBits.h
+  src/mozilla/TypesEnumInternal.h
   src/mozilla/Types.h
   src/mozilla/TypeTraits.h
+  src/mozilla/Vector.h
   src/mozilla/Util.h
   src/mozilla/WeakPtr.h)
+
+if(WIN32)
+  list(APPEND MFBT_PUBLIC_HDRS
+    src/mozilla/WindowsVersion.h)
+endif()
 
 install(FILES ${MFBT_PUBLIC_HDRS}
   DESTINATION ${CMAKE_INSTALL_PREFIX}/include/mozilla)

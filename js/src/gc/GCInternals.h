@@ -7,47 +7,58 @@
 #ifndef gc_GCInternals_h
 #define gc_GCInternals_h
 
-#include "jsapi.h"
+#include "jscntxt.h"
+#include "jsworkers.h"
+
+#include "gc/Zone.h"
+#include "vm/Runtime.h"
 
 namespace js {
 namespace gc {
 
 void
-MarkRuntime(JSTracer *trc, bool useSavedRoots = false);
+MarkPersistentRootedChains(JSTracer* trc);
 
 void
-BufferGrayRoots(GCMarker *gcmarker);
+MarkRuntime(JSTracer* trc, bool useSavedRoots = false);
 
-class AutoCopyFreeListToArenas {
-    JSRuntime *runtime;
+void
+BufferGrayRoots(GCMarker* gcmarker);
+
+class AutoCopyFreeListToArenas
+{
+    JSRuntime* runtime;
+    ZoneSelector selector;
 
   public:
-    AutoCopyFreeListToArenas(JSRuntime *rt);
+    AutoCopyFreeListToArenas(JSRuntime* rt, ZoneSelector selector);
     ~AutoCopyFreeListToArenas();
 };
 
 struct AutoFinishGC
 {
-    AutoFinishGC(JSRuntime *rt);
+    AutoFinishGC(JSRuntime* rt);
 };
 
 /*
  * This class should be used by any code that needs to exclusive access to the
  * heap in order to trace through it...
  */
-class AutoTraceSession {
+class AutoTraceSession
+{
   public:
-    AutoTraceSession(JSRuntime *rt, HeapState state = Tracing);
+    AutoTraceSession(JSRuntime* rt, HeapState state = Tracing);
     ~AutoTraceSession();
 
   protected:
-    JSRuntime *runtime;
+    AutoLockForExclusiveAccess lock;
+    JSRuntime* runtime;
 
   private:
     AutoTraceSession(const AutoTraceSession&) MOZ_DELETE;
     void operator=(const AutoTraceSession&) MOZ_DELETE;
 
-    js::HeapState prevState;
+    HeapState prevState;
 };
 
 struct AutoPrepareForTracing
@@ -56,70 +67,65 @@ struct AutoPrepareForTracing
     AutoTraceSession session;
     AutoCopyFreeListToArenas copy;
 
-    AutoPrepareForTracing(JSRuntime *rt);
+    AutoPrepareForTracing(JSRuntime* rt, ZoneSelector selector);
 };
 
 class IncrementalSafety
 {
-    const char *reason_;
+    const char* reason_;
 
-    IncrementalSafety(const char *reason) : reason_(reason) {}
+    IncrementalSafety(const char* reason) : reason_(reason) {}
 
   public:
-    static IncrementalSafety Safe() { return IncrementalSafety(NULL); }
-    static IncrementalSafety Unsafe(const char *reason) { return IncrementalSafety(reason); }
+    static IncrementalSafety Safe() { return IncrementalSafety(nullptr); }
+    static IncrementalSafety Unsafe(const char* reason) { return IncrementalSafety(reason); }
 
     typedef void (IncrementalSafety::* ConvertibleToBool)();
     void nonNull() {}
 
     operator ConvertibleToBool() const {
-        return reason_ == NULL ? &IncrementalSafety::nonNull : 0;
+        return reason_ == nullptr ? &IncrementalSafety::nonNull : 0;
     }
 
-    const char *reason() {
+    const char* reason() {
         JS_ASSERT(reason_);
         return reason_;
     }
 };
 
 IncrementalSafety
-IsIncrementalGCSafe(JSRuntime *rt);
-
-#ifdef JSGC_ROOT_ANALYSIS
-void *
-GetAddressableGCThing(JSRuntime *rt, uintptr_t w);
-#endif
+IsIncrementalGCSafe(JSRuntime* rt);
 
 #ifdef JS_GC_ZEAL
 void
-StartVerifyPreBarriers(JSRuntime *rt);
+StartVerifyPreBarriers(JSRuntime* rt);
 
 void
-EndVerifyPreBarriers(JSRuntime *rt);
+EndVerifyPreBarriers(JSRuntime* rt);
 
 void
-StartVerifyPostBarriers(JSRuntime *rt);
+StartVerifyPostBarriers(JSRuntime* rt);
 
 void
-EndVerifyPostBarriers(JSRuntime *rt);
+EndVerifyPostBarriers(JSRuntime* rt);
 
 void
-FinishVerifier(JSRuntime *rt);
+FinishVerifier(JSRuntime* rt);
 
 class AutoStopVerifyingBarriers
 {
-    JSRuntime *runtime;
+    JSRuntime* runtime;
     bool restartPreVerifier;
     bool restartPostVerifier;
     MOZ_DECL_USE_GUARD_OBJECT_NOTIFIER
 
   public:
-    AutoStopVerifyingBarriers(JSRuntime *rt, bool isShutdown
-                       MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
+    AutoStopVerifyingBarriers(JSRuntime* rt, bool isShutdown
+                              MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
       : runtime(rt)
     {
         restartPreVerifier = !isShutdown && rt->gcVerifyPreData;
-        restartPostVerifier = !isShutdown && rt->gcVerifyPostData;
+        restartPostVerifier = !isShutdown && rt->gcVerifyPostData && JS::IsGenerationalGCEnabled(rt);
         if (rt->gcVerifyPreData)
             EndVerifyPreBarriers(rt);
         if (rt->gcVerifyPostData)
@@ -137,7 +143,7 @@ class AutoStopVerifyingBarriers
 #else
 struct AutoStopVerifyingBarriers
 {
-    AutoStopVerifyingBarriers(JSRuntime *, bool) {}
+    AutoStopVerifyingBarriers(JSRuntime*, bool) {}
 };
 #endif /* JS_GC_ZEAL */
 

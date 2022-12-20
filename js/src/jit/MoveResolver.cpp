@@ -4,9 +4,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include "MoveResolver.h"
-
-#include "jsscriptinlines.h"
+#include "jit/MoveResolver.h"
 
 using namespace js;
 using namespace js::jit;
@@ -23,25 +21,25 @@ MoveResolver::resetState()
 }
 
 bool
-MoveResolver::addMove(const MoveOperand &from, const MoveOperand &to, Move::Kind kind)
+MoveResolver::addMove(const MoveOperand& from, const MoveOperand& to, MoveOp::Type type)
 {
     // Assert that we're not doing no-op moves.
     JS_ASSERT(!(from == to));
-    PendingMove *pm = movePool_.allocate();
+    PendingMove* pm = movePool_.allocate();
     if (!pm)
         return false;
-    new (pm) PendingMove(from, to, kind);
+    new (pm) PendingMove(from, to, type);
     pending_.pushBack(pm);
     return true;
 }
 
 // Given move (A -> B), this function attempts to find any move (B -> *) in the
 // pending move list, and returns the first one.
-MoveResolver::PendingMove *
-MoveResolver::findBlockingMove(const PendingMove *last)
+MoveResolver::PendingMove*
+MoveResolver::findBlockingMove(const PendingMove* last)
 {
     for (PendingMoveIterator iter = pending_.begin(); iter != pending_.end(); iter++) {
-        PendingMove *other = *iter;
+        PendingMove* other = *iter;
 
         if (other->from() == last->to()) {
             // We now have pairs in the form (A -> X) (X -> y). The second pair
@@ -51,7 +49,7 @@ MoveResolver::findBlockingMove(const PendingMove *last)
     }
 
     // No blocking moves found.
-    return NULL;
+    return nullptr;
 }
 
 bool
@@ -101,13 +99,13 @@ MoveResolver::resolve()
     //              Add L to O.
     //
     while (!pending_.empty()) {
-        PendingMove *pm = pending_.popBack();
+        PendingMove* pm = pending_.popBack();
 
         // Add this pending move to the cycle detection stack.
         stack.pushBack(pm);
 
         while (!stack.empty()) {
-            PendingMove *blocking = findBlockingMove(stack.peekBack());
+            PendingMove* blocking = findBlockingMove(stack.peekBack());
 
             if (blocking) {
                 if (blocking->to() == pm->from()) {
@@ -115,8 +113,8 @@ MoveResolver::resolve()
                     // assert that we do not find two cycles in one move chain
                     // traversal (which would indicate two moves to the same
                     // destination).
-                    pm->setInCycle();
-                    blocking->setInCycle();
+                    pm->setCycleEnd();
+                    blocking->setCycleBegin(pm->type());
                     hasCycles_ = true;
                     pending_.remove(blocking);
                     stack.pushBack(blocking);
@@ -130,7 +128,7 @@ MoveResolver::resolve()
                 // Otherwise, pop the last move on the search stack because it's
                 // complete and not participating in a cycle. The resulting
                 // move can safely be added to the ordered move list.
-                PendingMove *done = stack.popBack();
+                PendingMove* done = stack.popBack();
                 if (!orderedMoves_.append(*done))
                     return false;
                 movePool_.free(done);

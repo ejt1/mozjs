@@ -1,11 +1,21 @@
 mozilla_prepare_tests(mfbt
   TestAtomics
+  TestBinarySearch
   TestBloomFilter
   TestCasting
+  TestCeilingFloor
   TestCheckedInt
+  TestCountPopulation
+  TestCountZeroes
   TestEndian
   TestEnumSet
+  TestFloatingPoint
+  TestIntegerPrintfMacros
+  TestMacroArgs
+  TestMacroForEach
   TestPoisonArea
+  TestRollingMean
   TestSHA1
+  TestTypedEnum
   TestTypeTraits
   TestWeakPtr)

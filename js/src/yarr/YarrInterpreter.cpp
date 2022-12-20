@@ -26,11 +26,13 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "YarrInterpreter.h"
+#include "yarr/YarrInterpreter.h"
 
-#include "Yarr.h"
-#include "YarrCanonicalizeUCS2.h"
-#include "BumpPointerAllocator.h"
+#include "jscntxt.h"
+
+#include "yarr/Yarr.h"
+#include "yarr/YarrCanonicalizeUCS2.h"
+#include "yarr/BumpPointerAllocator.h"
 
 using namespace WTF;
 
@@ -1007,6 +1009,12 @@ public:
                     }
                 }
             } else {
+                // Avoid a topcrash before it occurs.
+                if (!backTrack->lastContext) {
+                    ASSERT(!"Tripped Bug 856796!");
+                    return JSRegExpErrorInternal;
+                }
+
                 resetMatches(term, context);
                 popParenthesesDisjunctionContext(backTrack);
                 freeParenthesesDisjunctionContext(context);
@@ -1051,6 +1059,12 @@ public:
                         recordParenthesesMatch(term, context);
                     }
                     return JSRegExpMatch;
+                }
+
+                // Avoid a topcrash before it occurs.
+                if (!backTrack->lastContext) {
+                    ASSERT(!"Tripped Bug 856796!");
+                    return JSRegExpErrorInternal;
                 }
 
                 // pop a match off the stack
@@ -1120,7 +1134,7 @@ public:
         ASSERT(context->term < static_cast<int>(disjunction->terms.size()));
 
         // Prevent jank resulting from getting stuck in Yarr for a long time.
-        if (!JS_CHECK_OPERATION_LIMIT(this->cx))
+        if (!CheckForInterrupt(this->cx))
             return JSRegExpErrorInternal;
 
         switch (currentTerm().type) {
@@ -1268,7 +1282,7 @@ public:
         case ByteTerm::TypeUncheckInput:
             input.uncheckInput(currentTerm().checkInputCount);
             MATCH_NEXT();
-                
+
         case ByteTerm::TypeDotStarEnclosure:
             if (matchDotStarEnclosure(currentTerm(), context))
                 return JSRegExpMatch;
@@ -1282,7 +1296,7 @@ public:
         ASSERT(context->term < static_cast<int>(disjunction->terms.size()));
 
         // Prevent jank resulting from getting stuck in Yarr for a long time.
-        if (!JS_CHECK_OPERATION_LIMIT(this->cx))
+        if (!CheckForInterrupt(this->cx))
             return JSRegExpErrorInternal;
 
         switch (currentTerm().type) {
@@ -1451,7 +1465,7 @@ public:
         return output[0];
     }
 
-    Interpreter(JSContext *cx, BytecodePattern* pattern, unsigned* output, const CharType* input, unsigned length, unsigned start)
+    Interpreter(JSContext* cx, BytecodePattern* pattern, unsigned* output, const CharType* input, unsigned length, unsigned start)
         : cx(cx)
         , pattern(pattern)
         , output(output)
@@ -1462,7 +1476,7 @@ public:
     }
 
 private:
-    JSContext *cx;
+    JSContext* cx;
     BytecodePattern* pattern;
     unsigned* output;
     InputStream input;
@@ -1500,7 +1514,7 @@ public:
         emitDisjunction(m_pattern.m_body);
         regexEnd();
 
-        return adoptPtr(js_new<BytecodePattern>(m_bodyDisjunction.release(), m_allParenthesesInfo, Ref<YarrPattern>(m_pattern), allocator));
+        return adoptPtr(newOrCrash<BytecodePattern>(m_bodyDisjunction.release(), m_allParenthesesInfo, Ref<YarrPattern>(m_pattern), allocator));
     }
 
     void checkInput(unsigned count)
@@ -1512,7 +1526,7 @@ public:
     {
         m_bodyDisjunction->terms.append(ByteTerm::UncheckInput(count));
     }
-    
+
     void assertionBOL(unsigned inputPosition)
     {
         m_bodyDisjunction->terms.append(ByteTerm::BOL(inputPosition));
@@ -1663,10 +1677,10 @@ public:
 #ifndef NDEBUG
     void dumpDisjunction(ByteDisjunction* disjunction)
     {
-        dataLog("ByteDisjunction(%p):\n\t", (void *)disjunction);
+        dataLogF("ByteDisjunction(%p):\n\t", (void*)disjunction);
         for (unsigned i = 0; i < disjunction->terms.size(); ++i)
-            dataLog("{ %d } ", disjunction->terms[i].type);
-        dataLog("\n");
+            dataLogF("{ %d } ", disjunction->terms[i].type);
+        dataLogF("\n");
     }
 #endif
 
@@ -1731,7 +1745,7 @@ public:
         unsigned subpatternId = parenthesesBegin.atom.subpatternId;
 
         unsigned numSubpatterns = lastSubpatternId - subpatternId + 1;
-        ByteDisjunction* parenthesesDisjunction = js_new<ByteDisjunction>(numSubpatterns, callFrameSize);
+        ByteDisjunction* parenthesesDisjunction = newOrCrash<ByteDisjunction>(numSubpatterns, callFrameSize);
 
         parenthesesDisjunction->terms.reserve(endTerm - beginTerm + 1);
         parenthesesDisjunction->terms.append(ByteTerm::SubpatternBegin());
@@ -1795,7 +1809,7 @@ public:
 
     void regexBegin(unsigned numSubpatterns, unsigned callFrameSize, bool onceThrough)
     {
-        m_bodyDisjunction = adoptPtr(js_new<ByteDisjunction>(numSubpatterns, callFrameSize));
+        m_bodyDisjunction = adoptPtr(newOrCrash<ByteDisjunction>(numSubpatterns, callFrameSize));
         m_bodyDisjunction->terms.append(ByteTerm::BodyAlternativeBegin(onceThrough));
         m_bodyDisjunction->terms[0].frameLocation = 0;
         m_currentAlternativeIndex = 0;
@@ -1948,7 +1962,7 @@ PassOwnPtr<BytecodePattern> byteCompile(YarrPattern& pattern, BumpPointerAllocat
     return ByteCompiler(pattern).compile(allocator);
 }
 
-unsigned interpret(JSContext *cx, BytecodePattern* bytecode, const String& input, unsigned start, unsigned* output)
+unsigned interpret(JSContext* cx, BytecodePattern* bytecode, const String& input, unsigned start, unsigned* output)
 {
 #if YARR_8BIT_CHAR_SUPPORT
     if (input.is8Bit())
@@ -1957,12 +1971,12 @@ unsigned interpret(JSContext *cx, BytecodePattern* bytecode, const String& input
     return Interpreter<UChar>(cx, bytecode, output, input.chars(), input.length(), start).interpret();
 }
 
-unsigned interpret(JSContext *cx, BytecodePattern* bytecode, const LChar* input, unsigned length, unsigned start, unsigned* output)
+unsigned interpret(JSContext* cx, BytecodePattern* bytecode, const LChar* input, unsigned length, unsigned start, unsigned* output)
 {
     return Interpreter<LChar>(cx, bytecode, output, input, length, start).interpret();
 }
 
-unsigned interpret(JSContext *cx, BytecodePattern* bytecode, const UChar* input, unsigned length, unsigned start, unsigned* output)
+unsigned interpret(JSContext* cx, BytecodePattern* bytecode, const UChar* input, unsigned length, unsigned start, unsigned* output)
 {
     return Interpreter<UChar>(cx, bytecode, output, input, length, start).interpret();
 }

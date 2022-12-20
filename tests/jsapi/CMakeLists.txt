@@ -1,9 +1,3 @@
-# TODO: Just temporarily define these to successfully compile and move later.
-add_definitions(-DSTATIC_JS_API)
-add_definitions(-DJS_DEFAULT_JITREPORT_GRANULARITY=3)
-add_definitions(-DWIN32)
-add_definitions(-D_AMD64_)
-
 set(JSAPI_TEST_SRCS
   tests.cpp
   selfTest.cpp
@@ -28,27 +22,33 @@ set(JSAPI_TEST_SRCS
   testException.cpp
   testExternalStrings.cpp
   testFindSCCs.cpp
+  testFreshGlobalEvalRedefinition.cpp
   testFuncCallback.cpp
   testFunctionProperties.cpp
   testGCExactRooting.cpp
   testGCFinalizeCallback.cpp
+  testGCHeapPostBarriers.cpp
   testGCOutOfMemory.cpp
-  testGetPropertyDefault.cpp
+  testGCStoreBufferRemoval.cpp
   testHashTable.cpp
   testHashTableInit.cpp
   testIndexToString.cpp
   testIntern.cpp
   testIntString.cpp
   testIntTypesABI.cpp
+  testIsInsideNursery.cpp
   testJSEvaluateScript.cpp
   testLookup.cpp
   testLooselyEqual.cpp
+  testMappedArrayBuffer.cpp
   testNewObject.cpp
+  testNullRoot.cpp
   testObjectEmulatingUndefined.cpp
   testOOM.cpp
   testOps.cpp
   testOriginPrincipals.cpp
   testParseJSON.cpp
+  testPersistentRooted.cpp
   testProfileStrings.cpp
   testPropCache.cpp
   testRegExp.cpp
@@ -57,13 +57,21 @@ set(JSAPI_TEST_SRCS
   testScriptInfo.cpp
   testScriptObject.cpp
   testSetProperty.cpp
+  testSetPropertyIgnoringNamedGetter.cpp
   testSourcePolicy.cpp
   testStringBuffer.cpp
+  testStructuredClone.cpp
   testToIntWidth.cpp
   testTrap.cpp
   testTypedArrays.cpp
+  testUncaughtError.cpp
   testUTF8.cpp
   testXDR.cpp)
+
+if(ENABLE_ION)
+  list(APPEND JSAPI_TEST_SRCS
+    testJitRValueAlloc.cpp)
+endif()
 
 add_executable(jsapi-tests ${JSAPI_TEST_SRCS})
 target_link_libraries(jsapi-tests PRIVATE js)

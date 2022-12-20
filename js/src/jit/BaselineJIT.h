@@ -9,20 +9,21 @@
 
 #ifdef JS_ION
 
+#include "mozilla/MemoryReporting.h"
+
 #include "jscntxt.h"
 #include "jscompartment.h"
 
-#include "IonCode.h"
-#include "IonMacroAssembler.h"
-#include "Bailouts.h"
-
 #include "ds/LifoAlloc.h"
+#include "jit/Bailouts.h"
+#include "jit/IonCode.h"
+#include "jit/IonMacroAssembler.h"
 
 namespace js {
 namespace jit {
 
 class StackValue;
-struct ICEntry;
+class ICEntry;
 class ICStub;
 
 class PCMappingSlotInfo
@@ -48,7 +49,7 @@ class PCMappingSlotInfo
         return (loc == SlotInR0) || (loc == SlotInR1) || (loc == SlotIgnore);
     }
 
-    static SlotLocation ToSlotLocation(const StackValue *stackVal);
+    static SlotLocation ToSlotLocation(const StackValue* stackVal);
 
     inline static PCMappingSlotInfo MakeSlotInfo() { return PCMappingSlotInfo(0); }
 
@@ -99,9 +100,18 @@ struct BaselineScript
   public:
     static const uint32_t MAX_JSSCRIPT_LENGTH = 0x0fffffffu;
 
+    // Limit the locals on a given script so that stack check on baseline frames
+    // doesn't overflow a uint32_t value.
+    // (MAX_JSSCRIPT_SLOTS * sizeof(Value)) must fit within a uint32_t.
+    static const uint32_t MAX_JSSCRIPT_SLOTS = 0xffffu;
+
   private:
     // Code pointer containing the actual method.
-    HeapPtr<IonCode> method_;
+    HeapPtr<JitCode> method_;
+
+    // For heavyweight scripts, template objects to use for the call object and
+    // decl env object (linked via the call object's enclosing scope).
+    HeapPtrObject templateScope_;
 
     // Allocated space for fallback stubs.
     FallbackICStubSpace fallbackStubSpace_;
@@ -109,11 +119,23 @@ struct BaselineScript
     // Native code offset right before the scope chain is initialized.
     uint32_t prologueOffset_;
 
+    // Native code offset right before the frame is popped and the method
+    // returned from.
+    uint32_t epilogueOffset_;
+
     // The offsets for the toggledJump instructions for SPS update ICs.
 #ifdef DEBUG
     mozilla::DebugOnly<bool> spsOn_;
 #endif
     uint32_t spsPushToggleOffset_;
+
+    // Native code offsets right after the debug prologue VM call returns, or
+    // would have returned. This offset is recorded even when debug mode is
+    // off to aid on-stack debug mode recompilation.
+    //
+    // We don't need one for the debug epilogue because that always happens
+    // right before the epilogue, so we just use the epilogue offset.
+    uint32_t postDebugPrologueOffset_;
 
   public:
     enum Flag {
@@ -123,14 +145,22 @@ struct BaselineScript
 
         // Flag set when discarding JIT code, to indicate this script is
         // on the stack and should not be discarded.
-        ACTIVE         = 1 << 1
+        ACTIVE = 1 << 1,
+
+        // Flag set when the script contains any writes to its on-stack
+        // (rather than call object stored) arguments.
+        MODIFIES_ARGUMENTS = 1 << 2,
+
+        // Flag set when compiled for use for debug mode. Handles various
+        // Debugger hooks and compiles toggled calls for traps.
+        DEBUG_MODE = 1 << 3
     };
 
   private:
     uint32_t flags_;
 
   private:
-    void trace(JSTracer *trc);
+    void trace(JSTracer* trc);
 
     uint32_t icEntriesOffset_;
     uint32_t icEntries_;
@@ -141,29 +171,36 @@ struct BaselineScript
     uint32_t pcMappingOffset_;
     uint32_t pcMappingSize_;
 
+    // List mapping indexes of bytecode type sets to the offset of the opcode
+    // they correspond to, for use by TypeScript::BytecodeTypes.
+    uint32_t bytecodeTypeMapOffset_;
+
   public:
     // Do not call directly, use BaselineScript::New. This is public for cx->new_.
-    BaselineScript(uint32_t prologueOffset, uint32_t spsPushToggleOffset);
+    BaselineScript(uint32_t prologueOffset, uint32_t epilogueOffset,
+                   uint32_t spsPushToggleOffset, uint32_t postDebugPrologueOffset);
 
-    static BaselineScript *New(JSContext *cx, uint32_t prologueOffset,
+    static BaselineScript* New(JSContext* cx, uint32_t prologueOffset,
+                               uint32_t epilogueOffset, uint32_t postDebugPrologueOffset,
                                uint32_t spsPushToggleOffset, size_t icEntries,
-                               size_t pcMappingIndexEntries, size_t pcMappingSize);
-    static void Trace(JSTracer *trc, BaselineScript *script);
-    static void Destroy(FreeOp *fop, BaselineScript *script);
+                               size_t pcMappingIndexEntries, size_t pcMappingSize,
+                               size_t bytecodeTypeMapEntries);
+    static void Trace(JSTracer* trc, BaselineScript* script);
+    static void Destroy(FreeOp* fop, BaselineScript* script);
 
-    void purgeOptimizedStubs(Zone *zone);
+    void purgeOptimizedStubs(Zone* zone);
 
     static inline size_t offsetOfMethod() {
         return offsetof(BaselineScript, method_);
     }
 
-    void sizeOfIncludingThis(JSMallocSizeOfFun mallocSizeOf, size_t *data,
-                             size_t *fallbackStubs) const {
-        *data = mallocSizeOf(this);
+    void addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf, size_t* data,
+                                size_t* fallbackStubs) const {
+        *data += mallocSizeOf(this);
 
-        // data already includes the ICStubSpace itself, so use
+        // |data| already includes the ICStubSpace itself, so use
         // sizeOfExcludingThis.
-        *fallbackStubs = fallbackStubSpace_.sizeOfExcludingThis(mallocSizeOf);
+        *fallbackStubs += fallbackStubSpace_.sizeOfExcludingThis(mallocSizeOf);
     }
 
     bool active() const {
@@ -180,121 +217,168 @@ struct BaselineScript
         flags_ |= NEEDS_ARGS_OBJ;
     }
 
+    void setModifiesArguments() {
+        flags_ |= MODIFIES_ARGUMENTS;
+    }
+    bool modifiesArguments() {
+        return flags_ & MODIFIES_ARGUMENTS;
+    }
+
+    void setDebugMode() {
+        flags_ |= DEBUG_MODE;
+    }
+    bool debugMode() const {
+        return flags_ & DEBUG_MODE;
+    }
+
     uint32_t prologueOffset() const {
         return prologueOffset_;
     }
-    uint8_t *prologueEntryAddr() const {
+    uint8_t* prologueEntryAddr() const {
         return method_->raw() + prologueOffset_;
     }
 
-    ICEntry *icEntryList() {
-        return (ICEntry *)(reinterpret_cast<uint8_t *>(this) + icEntriesOffset_);
+    uint32_t epilogueOffset() const {
+        return epilogueOffset_;
     }
-    PCMappingIndexEntry *pcMappingIndexEntryList() {
-        return (PCMappingIndexEntry *)(reinterpret_cast<uint8_t *>(this) + pcMappingIndexOffset_);
+    uint8_t* epilogueEntryAddr() const {
+        return method_->raw() + epilogueOffset_;
     }
-    uint8_t *pcMappingData() {
-        return reinterpret_cast<uint8_t *>(this) + pcMappingOffset_;
+
+    uint32_t postDebugPrologueOffset() const {
+        return postDebugPrologueOffset_;
     }
-    FallbackICStubSpace *fallbackStubSpace() {
+    uint8_t* postDebugPrologueAddr() const {
+        return method_->raw() + postDebugPrologueOffset_;
+    }
+
+    ICEntry* icEntryList() {
+        return (ICEntry*)(reinterpret_cast<uint8_t*>(this) + icEntriesOffset_);
+    }
+    PCMappingIndexEntry* pcMappingIndexEntryList() {
+        return (PCMappingIndexEntry*)(reinterpret_cast<uint8_t*>(this) + pcMappingIndexOffset_);
+    }
+    uint8_t* pcMappingData() {
+        return reinterpret_cast<uint8_t*>(this) + pcMappingOffset_;
+    }
+    FallbackICStubSpace* fallbackStubSpace() {
         return &fallbackStubSpace_;
     }
 
-    IonCode *method() const {
+    JitCode* method() const {
         return method_;
     }
-    void setMethod(IonCode *code) {
+    void setMethod(JitCode* code) {
         JS_ASSERT(!method_);
         method_ = code;
+    }
+
+    JSObject* templateScope() const {
+        return templateScope_;
+    }
+    void setTemplateScope(JSObject* templateScope) {
+        JS_ASSERT(!templateScope_);
+        templateScope_ = templateScope;
     }
 
     void toggleBarriers(bool enabled) {
         method()->togglePreBarriers(enabled);
     }
 
-    ICEntry &icEntry(size_t index);
-    ICEntry *maybeICEntryFromReturnOffset(CodeOffsetLabel returnOffset);
-    ICEntry &icEntryFromReturnOffset(CodeOffsetLabel returnOffset);
-    ICEntry &icEntryFromPCOffset(uint32_t pcOffset);
-    ICEntry &icEntryFromPCOffset(uint32_t pcOffset, ICEntry *prevLookedUpEntry);
-    ICEntry *maybeICEntryFromReturnAddress(uint8_t *returnAddr);
-    ICEntry &icEntryFromReturnAddress(uint8_t *returnAddr);
-    uint8_t *returnAddressForIC(const ICEntry &ent);
+    bool containsCodeAddress(uint8_t* addr) const {
+        return method()->raw() <= addr && addr <= method()->raw() + method()->instructionsSize();
+    }
+
+    ICEntry& icEntry(size_t index);
+    ICEntry* maybeICEntryFromReturnOffset(CodeOffsetLabel returnOffset);
+    ICEntry& icEntryFromReturnOffset(CodeOffsetLabel returnOffset);
+    ICEntry& icEntryFromPCOffset(uint32_t pcOffset);
+    ICEntry& icEntryForDebugModeRecompileFromPCOffset(uint32_t pcOffset);
+    ICEntry& icEntryFromPCOffset(uint32_t pcOffset, ICEntry* prevLookedUpEntry);
+    ICEntry* maybeICEntryFromReturnAddress(uint8_t* returnAddr);
+    ICEntry& icEntryFromReturnAddress(uint8_t* returnAddr);
+    uint8_t* returnAddressForIC(const ICEntry& ent);
 
     size_t numICEntries() const {
         return icEntries_;
     }
 
-    void copyICEntries(HandleScript script, const ICEntry *entries, MacroAssembler &masm);
-    void adoptFallbackStubs(FallbackICStubSpace *stubSpace);
+    void copyICEntries(JSScript* script, const ICEntry* entries, MacroAssembler& masm);
+    void adoptFallbackStubs(FallbackICStubSpace* stubSpace);
 
-    PCMappingIndexEntry &pcMappingIndexEntry(size_t index);
+    PCMappingIndexEntry& pcMappingIndexEntry(size_t index);
     CompactBufferReader pcMappingReader(size_t indexEntry);
 
     size_t numPCMappingIndexEntries() const {
         return pcMappingIndexEntries_;
     }
 
-    void copyPCMappingIndexEntries(const PCMappingIndexEntry *entries);
+    void copyPCMappingIndexEntries(const PCMappingIndexEntry* entries);
 
-    void copyPCMappingEntries(const CompactBufferWriter &entries);
-    uint8_t *nativeCodeForPC(JSScript *script, jsbytecode *pc, PCMappingSlotInfo *slotInfo = NULL);
-    jsbytecode *pcForReturnOffset(JSScript *script, uint32_t nativeOffset);
-    jsbytecode *pcForReturnAddress(JSScript *script, uint8_t *nativeAddress);
+    void copyPCMappingEntries(const CompactBufferWriter& entries);
+    uint8_t* nativeCodeForPC(JSScript* script, jsbytecode* pc, PCMappingSlotInfo* slotInfo = nullptr);
+    jsbytecode* pcForReturnOffset(JSScript* script, uint32_t nativeOffset);
+    jsbytecode* pcForReturnAddress(JSScript* script, uint8_t* nativeAddress);
 
     // Toggle debug traps (used for breakpoints and step mode) in the script.
-    // If |pc| is NULL, toggle traps for all ops in the script. Else, only
+    // If |pc| is nullptr, toggle traps for all ops in the script. Else, only
     // toggle traps at |pc|.
-    void toggleDebugTraps(JSScript *script, jsbytecode *pc);
+    void toggleDebugTraps(JSScript* script, jsbytecode* pc);
 
     void toggleSPS(bool enable);
 
     void noteAccessedGetter(uint32_t pcOffset);
+    void noteArrayWriteHole(uint32_t pcOffset);
 
     static size_t offsetOfFlags() {
         return offsetof(BaselineScript, flags_);
     }
 
-    static void writeBarrierPre(Zone *zone, BaselineScript *script);
+    static void writeBarrierPre(Zone* zone, BaselineScript* script);
+
+    uint32_t* bytecodeTypeMap() {
+        JS_ASSERT(bytecodeTypeMapOffset_);
+        return reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(this) + bytecodeTypeMapOffset_);
+    }
 };
 
 inline bool
-IsBaselineEnabled(JSContext *cx)
+IsBaselineEnabled(JSContext* cx)
 {
-    return cx->hasOption(JSOPTION_BASELINE);
+    return cx->runtime()->options().baseline();
 }
 
 MethodStatus
-CanEnterBaselineMethod(JSContext *cx, RunState &state);
+CanEnterBaselineMethod(JSContext* cx, RunState& state);
 
 MethodStatus
-CanEnterBaselineAtBranch(JSContext *cx, StackFrame *fp, bool newType);
+CanEnterBaselineAtBranch(JSContext* cx, InterpreterFrame* fp, bool newType);
 
 IonExecStatus
-EnterBaselineMethod(JSContext *cx, RunState &state);
+EnterBaselineMethod(JSContext* cx, RunState& state);
 
 IonExecStatus
-EnterBaselineAtBranch(JSContext *cx, StackFrame *fp, jsbytecode *pc);
+EnterBaselineAtBranch(JSContext* cx, InterpreterFrame* fp, jsbytecode* pc);
 
 void
-FinishDiscardBaselineScript(FreeOp *fop, JSScript *script);
+FinishDiscardBaselineScript(FreeOp* fop, JSScript* script);
 
 void
-SizeOfBaselineData(JSScript *script, JSMallocSizeOfFun mallocSizeOf, size_t *data,
-                   size_t *fallbackStubs);
+AddSizeOfBaselineData(JSScript* script, mozilla::MallocSizeOf mallocSizeOf, size_t* data,
+                      size_t* fallbackStubs);
 
 void
-ToggleBaselineSPS(JSRuntime *runtime, bool enable);
+ToggleBaselineSPS(JSRuntime* runtime, bool enable);
 
 struct BaselineBailoutInfo
 {
     // Pointer into the current C stack, where overwriting will start.
-    uint8_t *incomingStack;
+    uint8_t* incomingStack;
 
     // The top and bottom heapspace addresses of the reconstructed stack
     // which will be copied to the bottom.
-    uint8_t *copyStackTop;
-    uint8_t *copyStackBottom;
+    uint8_t* copyStackTop;
+    uint8_t* copyStackBottom;
 
     // Fields to store the top-of-stack baseline values that are held
     // in registers.  The setR0 and setR1 fields are flags indicating
@@ -305,10 +389,10 @@ struct BaselineBailoutInfo
     Value valueR1;
 
     // The value of the frame pointer register on resume.
-    void *resumeFramePtr;
+    void* resumeFramePtr;
 
     // The native code address to resume into.
-    void *resumeAddr;
+    void* resumeAddr;
 
     // If resuming into a TypeMonitor IC chain, this field holds the
     // address of the first stub in that chain.  If this field is
@@ -316,7 +400,7 @@ struct BaselineBailoutInfo
     // the first stub, not the resumeAddr above.  The resumeAddr
     // above, in this case, is pushed onto the stack so that the
     // TypeMonitor chain can tail-return into the main jitcode when done.
-    ICStub *monitorStub;
+    ICStub* monitorStub;
 
     // Number of baseline frames to push on the stack.
     uint32_t numFrames;
@@ -326,13 +410,17 @@ struct BaselineBailoutInfo
 };
 
 uint32_t
-BailoutIonToBaseline(JSContext *cx, JitActivation *activation, IonBailoutIterator &iter,
-                     bool invalidate, BaselineBailoutInfo **bailoutInfo);
+BailoutIonToBaseline(JSContext* cx, JitActivation* activation, IonBailoutIterator& iter,
+                     bool invalidate, BaselineBailoutInfo** bailoutInfo,
+                     const ExceptionBailoutInfo* exceptionInfo = nullptr);
 
 // Mark baseline scripts on the stack as active, so that they are not discarded
 // during GC.
 void
-MarkActiveBaselineScripts(Zone *zone);
+MarkActiveBaselineScripts(Zone* zone);
+
+MethodStatus
+BaselineCompile(JSContext* cx, JSScript* script);
 
 } // namespace jit
 } // namespace js

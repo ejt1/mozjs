@@ -4,28 +4,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "jit/shared/Lowering-shared-inl.h"
+
 #include "jit/LIR.h"
 #include "jit/MIR.h"
-#include "jit/MIRGraph.h"
-#include "Lowering-shared.h"
-#include "Lowering-shared-inl.h"
 
 using namespace js;
 using namespace jit;
 
 bool
-LIRGeneratorShared::visitConstant(MConstant *ins)
+LIRGeneratorShared::visitConstant(MConstant* ins)
 {
-    const Value &v = ins->value();
+    const Value& v = ins->value();
     switch (ins->type()) {
       case MIRType_Boolean:
-        return define(new LInteger(v.toBoolean()), ins);
+        return define(new(alloc()) LInteger(v.toBoolean()), ins);
       case MIRType_Int32:
-        return define(new LInteger(v.toInt32()), ins);
+        return define(new(alloc()) LInteger(v.toInt32()), ins);
       case MIRType_String:
-        return define(new LPointer(v.toString()), ins);
+        return define(new(alloc()) LPointer(v.toString()), ins);
       case MIRType_Object:
-        return define(new LPointer(&v.toObject()), ins);
+        return define(new(alloc()) LPointer(&v.toObject()), ins);
       default:
         // Constants of special types (undefined, null) should never flow into
         // here directly. Operations blindly consuming them require a Box.
@@ -35,9 +34,9 @@ LIRGeneratorShared::visitConstant(MConstant *ins)
 }
 
 bool
-LIRGeneratorShared::defineTypedPhi(MPhi *phi, size_t lirIndex)
+LIRGeneratorShared::defineTypedPhi(MPhi* phi, size_t lirIndex)
 {
-    LPhi *lir = current->getPhi(lirIndex);
+    LPhi* lir = current->getPhi(lirIndex);
 
     uint32_t vreg = getVirtualRegister();
     if (vreg >= MAX_VIRTUAL_REGISTERS)
@@ -50,40 +49,58 @@ LIRGeneratorShared::defineTypedPhi(MPhi *phi, size_t lirIndex)
 }
 
 void
-LIRGeneratorShared::lowerTypedPhiInput(MPhi *phi, uint32_t inputPosition, LBlock *block, size_t lirIndex)
+LIRGeneratorShared::lowerTypedPhiInput(MPhi* phi, uint32_t inputPosition, LBlock* block, size_t lirIndex)
 {
-    MDefinition *operand = phi->getOperand(inputPosition);
-    LPhi *lir = block->getPhi(lirIndex);
+    MDefinition* operand = phi->getOperand(inputPosition);
+    LPhi* lir = block->getPhi(lirIndex);
     lir->setOperand(inputPosition, LUse(operand->virtualRegister(), LUse::ANY));
 }
 
-#ifdef JS_NUNBOX32
-LSnapshot *
-LIRGeneratorShared::buildSnapshot(LInstruction *ins, MResumePoint *rp, BailoutKind kind)
+LRecoverInfo*
+LIRGeneratorShared::getRecoverInfo(MResumePoint* rp)
 {
-    LSnapshot *snapshot = LSnapshot::New(gen, rp, kind);
-    if (!snapshot)
-        return NULL;
+    if (cachedRecoverInfo_ && cachedRecoverInfo_->mir() == rp)
+        return cachedRecoverInfo_;
 
-    FlattenedMResumePointIter iter(rp);
-    if (!iter.init())
-        return NULL;
+    LRecoverInfo* recoverInfo = LRecoverInfo::New(gen, rp);
+    if (!recoverInfo)
+        return nullptr;
+
+    cachedRecoverInfo_ = recoverInfo;
+    return recoverInfo;
+}
+
+#ifdef JS_NUNBOX32
+LSnapshot*
+LIRGeneratorShared::buildSnapshot(LInstruction* ins, MResumePoint* rp, BailoutKind kind)
+{
+    LRecoverInfo* recover = getRecoverInfo(rp);
+    if (!recover)
+        return nullptr;
+
+    LSnapshot* snapshot = LSnapshot::New(gen, recover, kind);
+    if (!snapshot)
+        return nullptr;
 
     size_t i = 0;
-    for (MResumePoint **it = iter.begin(), **end = iter.end(); it != end; ++it) {
-        MResumePoint *mir = *it;
-        for (size_t j = 0; j < mir->numOperands(); ++i, ++j) {
-            MDefinition *ins = mir->getOperand(j);
+    for (MResumePoint** it = recover->begin(), **end = recover->end(); it != end; ++it) {
+        MResumePoint* mir = *it;
+        for (size_t j = 0, e = mir->numOperands(); j < e; ++i, ++j) {
+            MDefinition* ins = mir->getOperand(j);
 
-            LAllocation *type = snapshot->typeOfSlot(i);
-            LAllocation *payload = snapshot->payloadOfSlot(i);
+            LAllocation* type = snapshot->typeOfSlot(i);
+            LAllocation* payload = snapshot->payloadOfSlot(i);
 
-            if (ins->isPassArg())
-                ins = ins->toPassArg()->getArgument();
-            JS_ASSERT(!ins->isPassArg());
+            if (ins->isBox())
+                ins = ins->toBox()->getOperand(0);
 
             // Guards should never be eliminated.
             JS_ASSERT_IF(ins->isUnused(), !ins->isGuard());
+
+            // Snapshot operands other than constants should never be
+            // emitted-at-uses. Try-catch support depends on there being no
+            // code between an instruction and the LOsiPoint that follows it.
+            JS_ASSERT_IF(!ins->isConstant(), !ins->isEmittedAtUses());
 
             // The register allocation will fill these fields in with actual
             // register/stack assignments. During code generation, we can restore
@@ -97,8 +114,6 @@ LIRGeneratorShared::buildSnapshot(LInstruction *ins, MResumePoint *rp, BailoutKi
                 *type = LConstantIndex::Bogus();
                 *payload = use(ins, LUse::KEEPALIVE);
             } else {
-                if (!ensureDefined(ins))
-                    return NULL;
                 *type = useType(ins, LUse::KEEPALIVE);
                 *payload = usePayload(ins, LUse::KEEPALIVE);
             }
@@ -110,27 +125,35 @@ LIRGeneratorShared::buildSnapshot(LInstruction *ins, MResumePoint *rp, BailoutKi
 
 #elif JS_PUNBOX64
 
-LSnapshot *
-LIRGeneratorShared::buildSnapshot(LInstruction *ins, MResumePoint *rp, BailoutKind kind)
+LSnapshot*
+LIRGeneratorShared::buildSnapshot(LInstruction* ins, MResumePoint* rp, BailoutKind kind)
 {
-    LSnapshot *snapshot = LSnapshot::New(gen, rp, kind);
-    if (!snapshot)
-        return NULL;
+    LRecoverInfo* recover = getRecoverInfo(rp);
+    if (!recover)
+        return nullptr;
 
-    FlattenedMResumePointIter iter(rp);
-    if (!iter.init())
-        return NULL;
+    LSnapshot* snapshot = LSnapshot::New(gen, recover, kind);
+    if (!snapshot)
+        return nullptr;
 
     size_t i = 0;
-    for (MResumePoint **it = iter.begin(), **end = iter.end(); it != end; ++it) {
-        MResumePoint *mir = *it;
-        for (size_t j = 0; j < mir->numOperands(); ++i, ++j) {
-            MDefinition *def = mir->getOperand(j);
+    for (MResumePoint** it = recover->begin(), **end = recover->end(); it != end; ++it) {
+        MResumePoint* mir = *it;
+        for (size_t j = 0, e = mir->numOperands(); j < e; ++i, ++j) {
+            MDefinition* def = mir->getOperand(j);
 
-            if (def->isPassArg())
-                def = def->toPassArg()->getArgument();
+            if (def->isBox())
+                def = def->toBox()->getOperand(0);
 
-            LAllocation *a = snapshot->getEntry(i);
+            // Guards should never be eliminated.
+            JS_ASSERT_IF(def->isUnused(), !def->isGuard());
+
+            // Snapshot operands other than constants should never be
+            // emitted-at-uses. Try-catch support depends on there being no
+            // code between an instruction and the LOsiPoint that follows it.
+            JS_ASSERT_IF(!def->isConstant(), !def->isEmittedAtUses());
+
+            LAllocation* a = snapshot->getEntry(i);
 
             if (def->isUnused()) {
                 *a = LConstantIndex::Bogus();
@@ -146,13 +169,13 @@ LIRGeneratorShared::buildSnapshot(LInstruction *ins, MResumePoint *rp, BailoutKi
 #endif
 
 bool
-LIRGeneratorShared::assignSnapshot(LInstruction *ins, BailoutKind kind)
+LIRGeneratorShared::assignSnapshot(LInstruction* ins, BailoutKind kind)
 {
     // assignSnapshot must be called before define/add, since
     // it may add new instructions for emitted-at-use operands.
     JS_ASSERT(ins->id() == 0);
 
-    LSnapshot *snapshot = buildSnapshot(ins, lastResumePoint_, kind);
+    LSnapshot* snapshot = buildSnapshot(ins, lastResumePoint_, kind);
     if (!snapshot)
         return false;
 
@@ -161,19 +184,19 @@ LIRGeneratorShared::assignSnapshot(LInstruction *ins, BailoutKind kind)
 }
 
 bool
-LIRGeneratorShared::assignSafepoint(LInstruction *ins, MInstruction *mir)
+LIRGeneratorShared::assignSafepoint(LInstruction* ins, MInstruction* mir)
 {
     JS_ASSERT(!osiPoint_);
     JS_ASSERT(!ins->safepoint());
 
-    ins->initSafepoint();
+    ins->initSafepoint(alloc());
 
-    MResumePoint *mrp = mir->resumePoint() ? mir->resumePoint() : lastResumePoint_;
-    LSnapshot *postSnapshot = buildSnapshot(ins, mrp, Bailout_Normal);
+    MResumePoint* mrp = mir->resumePoint() ? mir->resumePoint() : lastResumePoint_;
+    LSnapshot* postSnapshot = buildSnapshot(ins, mrp, Bailout_Normal);
     if (!postSnapshot)
         return false;
 
-    osiPoint_ = new LOsiPoint(ins->safepoint(), postSnapshot);
+    osiPoint_ = new(alloc()) LOsiPoint(ins->safepoint(), postSnapshot);
 
     return lirGraph_.noteNeedsSafepoint(ins);
 }

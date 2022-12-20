@@ -6,10 +6,11 @@
 
 #ifdef DEBUG
 
-#include "Ion.h"
-#include "IonSpewer.h"
+#include "jit/IonSpewer.h"
 
-#include "jsscriptinlines.h"
+#include "jsworkers.h"
+
+#include "jit/Ion.h"
 
 #ifndef ION_SPEW_DIR
 # if defined(_WIN32)
@@ -41,7 +42,7 @@ static const char * const ChannelNames[] =
 static bool
 FilterContainsLocation(HandleScript function)
 {
-    static const char *filter = getenv("IONFILTER");
+    static const char* filter = getenv("IONFILTER");
 
     // If there is no filter we accept all outputs.
     if (!filter || !filter[0])
@@ -51,16 +52,16 @@ FilterContainsLocation(HandleScript function)
     if (!function)
         return false;
 
-    const char *filename = function->filename();
-    const size_t line = function->lineno;
-    static size_t filelen = strlen(filename);
-    const char *index = strstr(filter, filename);
+    const char* filename = function->filename();
+    const size_t line = function->lineno();
+    const size_t filelen = strlen(filename);
+    const char* index = strstr(filter, filename);
     while (index) {
         if (index == filter || index[-1] == ',') {
             if (index[filelen] == 0 || index[filelen] == ',')
                 return true;
             if (index[filelen] == ':' && line != size_t(-1)) {
-                size_t read_line = strtoul(&index[filelen + 1], NULL, 10);
+                size_t read_line = strtoul(&index[filelen + 1], nullptr, 10);
                 if (read_line == line)
                     return true;
             }
@@ -73,34 +74,35 @@ FilterContainsLocation(HandleScript function)
 void
 jit::EnableIonDebugLogging()
 {
+    EnableChannel(IonSpew_Logs);
     ionspewer.init();
 }
 
 void
-jit::IonSpewNewFunction(MIRGraph *graph, HandleScript function)
+jit::IonSpewNewFunction(MIRGraph* graph, HandleScript func)
 {
-    if (!js_IonOptions.parallelCompilation)
-        ionspewer.beginFunction(graph, function);
+    if (GetIonContext()->runtime->onMainThread())
+        ionspewer.beginFunction(graph, func);
 }
 
 void
-jit::IonSpewPass(const char *pass)
+jit::IonSpewPass(const char* pass)
 {
-    if (!js_IonOptions.parallelCompilation)
+    if (GetIonContext()->runtime->onMainThread())
         ionspewer.spewPass(pass);
 }
 
 void
-jit::IonSpewPass(const char *pass, LinearScanAllocator *ra)
+jit::IonSpewPass(const char* pass, LinearScanAllocator* ra)
 {
-    if (!js_IonOptions.parallelCompilation)
+    if (GetIonContext()->runtime->onMainThread())
         ionspewer.spewPass(pass, ra);
 }
 
 void
 jit::IonSpewEndFunction()
 {
-    if (!js_IonOptions.parallelCompilation)
+    if (GetIonContext()->runtime->onMainThread())
         ionspewer.endFunction();
 }
 
@@ -136,7 +138,7 @@ IonSpewer::isSpewingFunction() const
 }
 
 void
-IonSpewer::beginFunction(MIRGraph *graph, HandleScript function)
+IonSpewer::beginFunction(MIRGraph* graph, HandleScript function)
 {
     if (!inited_)
         return;
@@ -149,14 +151,14 @@ IonSpewer::beginFunction(MIRGraph *graph, HandleScript function)
     }
 
     this->graph = graph;
-    this->function = function;
+    this->function.repoint(function);
 
     c1Spewer.beginFunction(graph, function);
     jsonSpewer.beginFunction(function);
 }
 
 void
-IonSpewer::spewPass(const char *pass)
+IonSpewer::spewPass(const char* pass)
 {
     if (!isSpewingFunction())
         return;
@@ -169,7 +171,7 @@ IonSpewer::spewPass(const char *pass)
 }
 
 void
-IonSpewer::spewPass(const char *pass, LinearScanAllocator *ra)
+IonSpewer::spewPass(const char* pass, LinearScanAllocator* ra)
 {
     if (!isSpewingFunction())
         return;
@@ -187,24 +189,27 @@ void
 IonSpewer::endFunction()
 {
     if (!isSpewingFunction()) {
-        filteredOutCompilations--;
+        if (inited_) {
+            JS_ASSERT(filteredOutCompilations != 0);
+            filteredOutCompilations--;
+        }
         return;
     }
 
     c1Spewer.endFunction();
     jsonSpewer.endFunction();
 
-    this->graph = NULL;
+    this->graph = nullptr;
 }
 
 
-FILE *jit::IonSpewFile = NULL;
+FILE* jit::IonSpewFile = nullptr;
 
 static bool
-ContainsFlag(const char *str, const char *flag)
+ContainsFlag(const char* str, const char* flag)
 {
     size_t flaglen = strlen(flag);
-    const char *index = strstr(str, flag);
+    const char* index = strstr(str, flag);
     while (index) {
         if ((index == str || index[-1] == ',') && (index[flaglen] == 0 || index[flaglen] == ','))
             return true;
@@ -219,11 +224,11 @@ jit::CheckLogging()
     if (LoggingChecked)
         return;
     LoggingChecked = true;
-    const char *env = getenv("IONFLAGS");
+    const char* env = getenv("IONFLAGS");
     if (!env)
         return;
     if (strstr(env, "help")) {
-        fflush(NULL);
+        fflush(nullptr);
         printf(
             "\n"
             "usage: IONFLAGS=option,option,option,... where options can be:\n"
@@ -244,6 +249,7 @@ jit::CheckLogging()
             "  safepoints Safepoints\n"
             "  pools      Literal Pools (ARM only for now)\n"
             "  cacheflush Instruction Cache flushes (ARM only for now)\n"
+            "  range      Range Analysis\n"
             "  logs       C1 and JSON visualization logging\n"
             "  trace      Generate calls to js::jit::Trace() for effectful instructions\n"
             "  all        Everything\n"
@@ -255,6 +261,7 @@ jit::CheckLogging()
             "  bl-ic-fb   Baseline IC fallback stub messages\n"
             "  bl-osr     Baseline IC OSR messages\n"
             "  bl-bails   Baseline bailouts\n"
+            "  bl-dbg-osr Baseline debug mode on stack recompile messages\n"
             "  bl-all     All baseline spew\n"
             "\n"
         );
@@ -316,6 +323,8 @@ jit::CheckLogging()
         EnableChannel(IonSpew_BaselineOSR);
     if (ContainsFlag(env, "bl-bails"))
         EnableChannel(IonSpew_BaselineBailouts);
+    if (ContainsFlag(env, "bl-dbg-osr"))
+        EnableChannel(IonSpew_BaselineDebugModeOSR);
     if (ContainsFlag(env, "bl-all")) {
         EnableChannel(IonSpew_BaselineAbort);
         EnableChannel(IonSpew_BaselineScripts);
@@ -324,16 +333,14 @@ jit::CheckLogging()
         EnableChannel(IonSpew_BaselineICFallback);
         EnableChannel(IonSpew_BaselineOSR);
         EnableChannel(IonSpew_BaselineBailouts);
+        EnableChannel(IonSpew_BaselineDebugModeOSR);
     }
-
-    if (LoggingBits != 0)
-        EnableIonDebugLogging();
 
     IonSpewFile = stderr;
 }
 
 void
-jit::IonSpewStartVA(IonSpewChannel channel, const char *fmt, va_list ap)
+jit::IonSpewStartVA(IonSpewChannel channel, const char* fmt, va_list ap)
 {
     if (!IonSpewEnabled(channel))
         return;
@@ -343,7 +350,7 @@ jit::IonSpewStartVA(IonSpewChannel channel, const char *fmt, va_list ap)
 }
 
 void
-jit::IonSpewContVA(IonSpewChannel channel, const char *fmt, va_list ap)
+jit::IonSpewContVA(IonSpewChannel channel, const char* fmt, va_list ap)
 {
     if (!IonSpewEnabled(channel))
         return;
@@ -361,14 +368,14 @@ jit::IonSpewFin(IonSpewChannel channel)
 }
 
 void
-jit::IonSpewVA(IonSpewChannel channel, const char *fmt, va_list ap)
+jit::IonSpewVA(IonSpewChannel channel, const char* fmt, va_list ap)
 {
     IonSpewStartVA(channel, fmt, ap);
     IonSpewFin(channel);
 }
 
 void
-jit::IonSpew(IonSpewChannel channel, const char *fmt, ...)
+jit::IonSpew(IonSpewChannel channel, const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -377,7 +384,7 @@ jit::IonSpew(IonSpewChannel channel, const char *fmt, ...)
 }
 
 void
-jit::IonSpewStart(IonSpewChannel channel, const char *fmt, ...)
+jit::IonSpewStart(IonSpewChannel channel, const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -385,7 +392,7 @@ jit::IonSpewStart(IonSpewChannel channel, const char *fmt, ...)
     va_end(ap);
 }
 void
-jit::IonSpewCont(IonSpewChannel channel, const char *fmt, ...)
+jit::IonSpewCont(IonSpewChannel channel, const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);

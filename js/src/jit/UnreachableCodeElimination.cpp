@@ -4,10 +4,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#include "UnreachableCodeElimination.h"
-#include "IonAnalysis.h"
-#include "AliasAnalysis.h"
-#include "ValueNumbering.h"
+#include "jit/UnreachableCodeElimination.h"
+
+#include "jit/AliasAnalysis.h"
+#include "jit/IonAnalysis.h"
+#include "jit/MIRGenerator.h"
+#include "jit/ValueNumbering.h"
 
 using namespace js;
 using namespace jit;
@@ -80,8 +82,8 @@ UnreachableCodeElimination::removeUnmarkedBlocksAndCleanup()
 
     // Pass 5: It's important for optimizations to re-run GVN (and in
     // turn alias analysis) after UCE if we eliminated branches.
-    if (rerunAliasAnalysis_ && js_IonOptions.gvn) {
-        ValueNumberer gvn(mir_, graph_, js_IonOptions.gvnIsOptimistic);
+    if (rerunAliasAnalysis_ && mir_->optimizationInfo().gvnEnabled()) {
+        ValueNumberer gvn(mir_, graph_, mir_->optimizationInfo().gvnKind() == GVN_Optimistic);
         if (!gvn.clear() || !gvn.analyze())
             return false;
         IonSpewPass("GVN-after-UCE");
@@ -95,7 +97,7 @@ UnreachableCodeElimination::removeUnmarkedBlocksAndCleanup()
 }
 
 bool
-UnreachableCodeElimination::enqueue(MBasicBlock *block, BlockList &list)
+UnreachableCodeElimination::enqueue(MBasicBlock* block, BlockList& list)
 {
     if (block->isMarked())
         return true;
@@ -105,24 +107,23 @@ UnreachableCodeElimination::enqueue(MBasicBlock *block, BlockList &list)
     return list.append(block);
 }
 
-MBasicBlock *
-UnreachableCodeElimination::optimizableSuccessor(MBasicBlock *block)
+MBasicBlock*
+UnreachableCodeElimination::optimizableSuccessor(MBasicBlock* block)
 {
     // If the last instruction in `block` is a test instruction of a
     // constant value, returns the successor that the branch will
-    // always branch to at runtime. Otherwise, returns NULL.
+    // always branch to at runtime. Otherwise, returns nullptr.
 
-    MControlInstruction *ins = block->lastIns();
+    MControlInstruction* ins = block->lastIns();
     if (!ins->isTest())
-        return NULL;
+        return nullptr;
 
-    MTest *testIns = ins->toTest();
-    MDefinition *v = testIns->getOperand(0);
+    MTest* testIns = ins->toTest();
+    MDefinition* v = testIns->getOperand(0);
     if (!v->isConstant())
-        return NULL;
+        return nullptr;
 
-    const Value &val = v->toConstant()->value();
-    BranchDirection bdir = ToBoolean(val) ? TRUE_BRANCH : FALSE_BRANCH;
+    BranchDirection bdir = v->toConstant()->valueToBoolean() ? TRUE_BRANCH : FALSE_BRANCH;
     return testIns->branchSuccessor(bdir);
 }
 
@@ -139,11 +140,11 @@ UnreachableCodeElimination::prunePointlessBranchesAndMarkReachableBlocks()
         if (mir_->shouldCancel("Eliminate Unreachable Code"))
             return false;
 
-        MBasicBlock *block = worklist.popCopy();
+        MBasicBlock* block = worklist.popCopy();
 
         // If this block is a test on a constant operand, only enqueue
         // the relevant successor. Also, remember the block for later.
-        if (MBasicBlock *succ = optimizableSuccessor(block)) {
+        if (MBasicBlock* succ = optimizableSuccessor(block)) {
             if (!optimizableBlocks.append(block))
                 return false;
             if (!enqueue(succ, worklist))
@@ -151,7 +152,7 @@ UnreachableCodeElimination::prunePointlessBranchesAndMarkReachableBlocks()
         } else {
             // Otherwise just visit all successors.
             for (size_t i = 0; i < block->numSuccessors(); i++) {
-                MBasicBlock *succ = block->getSuccessor(i);
+                MBasicBlock* succ = block->getSuccessor(i);
                 if (!enqueue(succ, worklist))
                     return false;
             }
@@ -165,7 +166,7 @@ UnreachableCodeElimination::prunePointlessBranchesAndMarkReachableBlocks()
     // stack types is incorrect or incomplete, due to operations that
     // have not yet executed in baseline.
     if (graph_.osrBlock()) {
-        MBasicBlock *osrBlock = graph_.osrBlock();
+        MBasicBlock* osrBlock = graph_.osrBlock();
         JS_ASSERT(!osrBlock->isMarked());
         if (!enqueue(osrBlock, worklist))
             return false;
@@ -183,27 +184,27 @@ UnreachableCodeElimination::prunePointlessBranchesAndMarkReachableBlocks()
     // Now that we know we will not abort due to OSR, go back and
     // transform any tests on constant operands into gotos.
     for (uint32_t i = 0; i < optimizableBlocks.length(); i++) {
-        MBasicBlock *block = optimizableBlocks[i];
-        MBasicBlock *succ = optimizableSuccessor(block);
+        MBasicBlock* block = optimizableBlocks[i];
+        MBasicBlock* succ = optimizableSuccessor(block);
         JS_ASSERT(succ);
 
-        MGoto *gotoIns = MGoto::New(succ);
+        MGoto* gotoIns = MGoto::New(graph_.alloc(), succ);
         block->discardLastIns();
         block->end(gotoIns);
-        MBasicBlock *successorWithPhis = block->successorWithPhis();
+        MBasicBlock* successorWithPhis = block->successorWithPhis();
         if (successorWithPhis && successorWithPhis != succ)
-            block->setSuccessorWithPhis(NULL, 0);
+            block->setSuccessorWithPhis(nullptr, 0);
     }
 
     return true;
 }
 
 void
-UnreachableCodeElimination::checkDependencyAndRemoveUsesFromUnmarkedBlocks(MDefinition *instr)
+UnreachableCodeElimination::checkDependencyAndRemoveUsesFromUnmarkedBlocks(MDefinition* instr)
 {
     // When the instruction depends on removed block,
     // alias analysis needs to get rerun to have the right dependency.
-    if (instr->dependency() && !instr->dependency()->block()->isMarked())
+    if (!disableAliasAnalysis_ && instr->dependency() && !instr->dependency()->block()->isMarked())
         rerunAliasAnalysis_ = true;
 
     for (MUseIterator iter(instr->usesBegin()); iter != instr->usesEnd(); ) {
@@ -229,7 +230,7 @@ UnreachableCodeElimination::removeUnmarkedBlocksAndClearDominators()
         if (mir_->shouldCancel("Eliminate Unreachable Code"))
             return false;
 
-        MBasicBlock *block = *iter;
+        MBasicBlock* block = *iter;
         iter++;
 
         // Unconditionally clear the dominators.  It's somewhat complex to
@@ -248,7 +249,7 @@ UnreachableCodeElimination::removeUnmarkedBlocksAndClearDominators()
                 // predecessors need to have the successorWithPhis
                 // flag cleared.
                 for (size_t i = 0; i < block->numPredecessors(); i++)
-                    block->getPredecessor(i)->setSuccessorWithPhis(NULL, 0);
+                    block->getPredecessor(i)->setSuccessorWithPhis(nullptr, 0);
             }
 
             if (block->isLoopBackedge()) {
@@ -271,7 +272,7 @@ UnreachableCodeElimination::removeUnmarkedBlocksAndClearDominators()
             }
 
             for (size_t i = 0, c = block->numSuccessors(); i < c; i++) {
-                MBasicBlock *succ = block->getSuccessor(i);
+                MBasicBlock* succ = block->getSuccessor(i);
                 if (succ->isMarked()) {
                     // succ is on the frontier of blocks to be removed:
                     succ->removePredecessor(block);
@@ -283,22 +284,6 @@ UnreachableCodeElimination::removeUnmarkedBlocksAndClearDominators()
                                 break;
                             }
                         }
-                    }
-                }
-            }
-
-            // When we remove a call, we can't leave the corresponding MPassArg
-            // in the graph. Since lowering will fail. Replace it with the
-            // argument for the exceptional case when it is kept alive in a
-            // ResumePoint. DCE will remove the unused MPassArg instruction.
-            for (MInstructionIterator iter(block->begin()); iter != block->end(); iter++) {
-                if (iter->isCall()) {
-                    MCall *call = iter->toCall();
-                    for (size_t i = 0; i < call->numStackArgs(); i++) {
-                        JS_ASSERT(call->getArg(i)->isPassArg());
-                        JS_ASSERT(call->getArg(i)->defUseCount() == 1);
-                        MPassArg *arg = call->getArg(i)->toPassArg();
-                        arg->replaceAllUsesWith(arg->getArgument());
                     }
                 }
             }

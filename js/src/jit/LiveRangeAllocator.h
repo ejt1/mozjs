@@ -7,10 +7,11 @@
 #ifndef jit_LiveRangeAllocator_h
 #define jit_LiveRangeAllocator_h
 
+#include "mozilla/Array.h"
 #include "mozilla/DebugOnly.h"
 
-#include "RegisterAllocator.h"
-#include "StackSlotAllocator.h"
+#include "jit/RegisterAllocator.h"
+#include "jit/StackSlotAllocator.h"
 
 // Common structures and functions used by register allocators that operate on
 // virtual register live ranges.
@@ -35,19 +36,24 @@ class Requirement
     Requirement(Kind kind)
       : kind_(kind)
     {
-        // These have dedicated constructors;
+        // These have dedicated constructors.
         JS_ASSERT(kind != FIXED && kind != SAME_AS_OTHER);
     }
 
     Requirement(Kind kind, CodePosition at)
       : kind_(kind),
         position_(at)
-    { }
+    {
+        // These have dedicated constructors.
+        JS_ASSERT(kind != FIXED && kind != SAME_AS_OTHER);
+    }
 
     Requirement(LAllocation fixed)
       : kind_(FIXED),
         allocation_(fixed)
-    { }
+    {
+        JS_ASSERT(fixed == LAllocation() || !fixed.isUse());
+    }
 
     // Only useful as a hint, encodes where the fixed requirement is used to
     // avoid allocating a fixed register too early.
@@ -55,7 +61,9 @@ class Requirement
       : kind_(FIXED),
         allocation_(fixed),
         position_(at)
-    { }
+    {
+        JS_ASSERT(fixed == LAllocation() || !fixed.isUse());
+    }
 
     Requirement(uint32_t vreg, CodePosition at)
       : kind_(SAME_AS_OTHER),
@@ -74,6 +82,7 @@ class Requirement
 
     uint32_t virtualRegister() const {
         JS_ASSERT(allocation_.isUse());
+        JS_ASSERT(kind() == SAME_AS_OTHER);
         return allocation_.toUse()->virtualRegister();
     }
 
@@ -92,10 +101,10 @@ class Requirement
 struct UsePosition : public TempObject,
                      public InlineForwardListNode<UsePosition>
 {
-    LUse *use;
+    LUse* use;
     CodePosition pos;
 
-    UsePosition(LUse *use, CodePosition pos) :
+    UsePosition(LUse* use, CodePosition pos) :
         use(use),
         pos(pos)
     { }
@@ -104,7 +113,7 @@ struct UsePosition : public TempObject,
 typedef InlineForwardListIterator<UsePosition> UsePositionIterator;
 
 static inline bool
-UseCompatibleWith(const LUse *use, LAllocation alloc)
+UseCompatibleWith(const LUse* use, LAllocation alloc)
 {
     switch (use->policy()) {
       case LUse::ANY:
@@ -117,27 +126,26 @@ UseCompatibleWith(const LUse *use, LAllocation alloc)
           // UsePosition is only used as hint.
         return alloc.isRegister();
       default:
-        JS_NOT_REACHED("Unknown use policy");
+        MOZ_ASSUME_UNREACHABLE("Unknown use policy");
     }
-    return false;
 }
 
 #ifdef DEBUG
 
 static inline bool
-DefinitionCompatibleWith(LInstruction *ins, const LDefinition *def, LAllocation alloc)
+DefinitionCompatibleWith(LInstruction* ins, const LDefinition* def, LAllocation alloc)
 {
     if (ins->isPhi()) {
-        if (def->type() == LDefinition::DOUBLE)
-            return alloc.isFloatReg() || alloc.kind() == LAllocation::DOUBLE_SLOT;
-        return alloc.isGeneralReg() || alloc.kind() == LAllocation::STACK_SLOT;
+        if (def->isFloatReg())
+            return alloc.isFloatReg() || alloc.isStackSlot();
+        return alloc.isGeneralReg() || alloc.isStackSlot();
     }
 
     switch (def->policy()) {
       case LDefinition::DEFAULT:
         if (!alloc.isRegister())
             return false;
-        return alloc.isFloatReg() == (def->type() == LDefinition::DOUBLE);
+        return alloc.isFloatReg() == def->isFloatReg();
       case LDefinition::PRESET:
         return alloc == *def->output();
       case LDefinition::MUST_REUSE_INPUT:
@@ -147,29 +155,28 @@ DefinitionCompatibleWith(LInstruction *ins, const LDefinition *def, LAllocation 
       case LDefinition::PASSTHROUGH:
         return true;
       default:
-        JS_NOT_REACHED("Unknown definition policy");
+        MOZ_ASSUME_UNREACHABLE("Unknown definition policy");
     }
-    return false;
 }
 
 #endif // DEBUG
 
-static inline LDefinition *
-FindReusingDefinition(LInstruction *ins, LAllocation *alloc)
+static inline LDefinition*
+FindReusingDefinition(LInstruction* ins, LAllocation* alloc)
 {
     for (size_t i = 0; i < ins->numDefs(); i++) {
-        LDefinition *def = ins->getDef(i);
+        LDefinition* def = ins->getDef(i);
         if (def->policy() == LDefinition::MUST_REUSE_INPUT &&
             ins->getOperand(def->getReusedInput()) == alloc)
             return def;
     }
     for (size_t i = 0; i < ins->numTemps(); i++) {
-        LDefinition *def = ins->getTemp(i);
+        LDefinition* def = ins->getTemp(i);
         if (def->policy() == LDefinition::MUST_REUSE_INPUT &&
             ins->getOperand(def->getReusedInput()) == alloc)
             return def;
     }
-    return NULL;
+    return nullptr;
 }
 
 /*
@@ -207,16 +214,17 @@ class LiveInterval
         }
 
         // Whether this range wholly contains other.
-        bool contains(const Range *other) const;
+        bool contains(const Range* other) const;
 
         // Intersect this range with other, returning the subranges of this
         // that are before, inside, or after other.
-        void intersect(const Range *other, Range *pre, Range *inside, Range *post) const;
+        void intersect(const Range* other, Range* pre, Range* inside, Range* post) const;
     };
 
   private:
     Vector<Range, 1, IonAllocPolicy> ranges_;
     LAllocation alloc_;
+    LiveInterval* spillInterval_;
     uint32_t vreg_;
     uint32_t index_;
     Requirement requirement_;
@@ -224,24 +232,34 @@ class LiveInterval
     InlineForwardList<UsePosition> uses_;
     size_t lastProcessedRange_;
 
+    LiveInterval(TempAllocator& alloc, uint32_t vreg, uint32_t index)
+      : ranges_(alloc),
+        spillInterval_(nullptr),
+        vreg_(vreg),
+        index_(index),
+        lastProcessedRange_(size_t(-1))
+    { }
+
+    LiveInterval(TempAllocator& alloc, uint32_t index)
+      : ranges_(alloc),
+        spillInterval_(nullptr),
+        vreg_(UINT32_MAX),
+        index_(index),
+        lastProcessedRange_(size_t(-1))
+    { }
+
   public:
-
-    LiveInterval(uint32_t vreg, uint32_t index)
-      : vreg_(vreg),
-        index_(index),
-        lastProcessedRange_(size_t(-1))
-    { }
-
-    LiveInterval(uint32_t index)
-      : vreg_(UINT32_MAX),
-        index_(index),
-        lastProcessedRange_(size_t(-1))
-    { }
+    static LiveInterval* New(TempAllocator& alloc, uint32_t vreg, uint32_t index) {
+        return new(alloc) LiveInterval(alloc, vreg, index);
+    }
+    static LiveInterval* New(TempAllocator& alloc, uint32_t index) {
+        return new(alloc) LiveInterval(alloc, index);
+    }
 
     bool addRange(CodePosition from, CodePosition to);
     bool addRangeAtHead(CodePosition from, CodePosition to);
     void setFrom(CodePosition from);
-    CodePosition intersect(LiveInterval *other);
+    CodePosition intersect(LiveInterval* other);
     bool covers(CodePosition pos);
     CodePosition nextCoveredAfter(CodePosition pos);
 
@@ -258,7 +276,7 @@ class LiveInterval
     size_t numRanges() const {
         return ranges_.length();
     }
-    const Range *getRange(size_t i) const {
+    const Range* getRange(size_t i) const {
         return &ranges_[i];
     }
     void setLastProcessedRange(size_t range, mozilla::DebugOnly<CodePosition> pos) {
@@ -273,11 +291,17 @@ class LiveInterval
         return ranges_.length() - 1;
     }
 
-    LAllocation *getAllocation() {
+    LAllocation* getAllocation() {
         return &alloc_;
     }
     void setAllocation(LAllocation alloc) {
         alloc_ = alloc;
+    }
+    void setSpillInterval(LiveInterval* spill) {
+        spillInterval_ = spill;
+    }
+    LiveInterval* spillInterval() {
+        return spillInterval_;
     }
     bool hasVreg() const {
         return vreg_ != UINT32_MAX;
@@ -292,16 +316,16 @@ class LiveInterval
     void setIndex(uint32_t index) {
         index_ = index;
     }
-    const Requirement *requirement() const {
+    const Requirement* requirement() const {
         return &requirement_;
     }
-    void setRequirement(const Requirement &requirement) {
+    void setRequirement(const Requirement& requirement) {
         // A SAME_AS_OTHER requirement complicates regalloc too much; it
         // should only be used as hint.
         JS_ASSERT(requirement.kind() != Requirement::SAME_AS_OTHER);
         requirement_ = requirement;
     }
-    bool addRequirement(const Requirement &newRequirement) {
+    bool addRequirement(const Requirement& newRequirement) {
         // Merge newRequirement with any existing requirement, returning false
         // if the new and old requirements conflict.
         JS_ASSERT(newRequirement.kind() != Requirement::SAME_AS_OTHER);
@@ -320,19 +344,20 @@ class LiveInterval
         requirement_ = newRequirement;
         return true;
     }
-    const Requirement *hint() const {
+    const Requirement* hint() const {
         return &hint_;
     }
-    void setHint(const Requirement &hint) {
+    void setHint(const Requirement& hint) {
         hint_ = hint;
     }
     bool isSpill() const {
         return alloc_.isStackSlot();
     }
-    bool splitFrom(CodePosition pos, LiveInterval *after);
+    bool splitFrom(CodePosition pos, LiveInterval* after);
 
-    void addUse(UsePosition *use);
-    UsePosition *nextUseAfter(CodePosition pos);
+    void addUse(UsePosition* use);
+    void addUseAtEnd(UsePosition* use);
+    UsePosition* nextUseAfter(CodePosition pos);
     CodePosition nextUsePosAfter(CodePosition pos);
     CodePosition firstIncompatibleUse(LAllocation alloc);
 
@@ -344,9 +369,23 @@ class LiveInterval
         return uses_.end();
     }
 
+    bool usesEmpty() const {
+        return uses_.empty();
+    }
+
+    UsePosition* usesBack() {
+        return uses_.back();
+    }
+
 #ifdef DEBUG
     void validateRanges();
 #endif
+
+    // Return a string describing the ranges in this LiveInterval. This is
+    // not re-entrant!
+    const char* rangesToString() const;
+
+    void dump();
 };
 
 /*
@@ -356,38 +395,43 @@ class LiveInterval
  */
 class VirtualRegister
 {
-    uint32_t id_;
-    LBlock *block_;
-    LInstruction *ins_;
-    LDefinition *def_;
-    Vector<LiveInterval *, 1, IonAllocPolicy> intervals_;
+    LBlock* block_;
+    LInstruction* ins_;
+    LDefinition* def_;
+    Vector<LiveInterval*, 1, IonAllocPolicy> intervals_;
 
     // Whether def_ is a temp or an output.
     bool isTemp_ : 1;
 
+    void operator=(const VirtualRegister&) MOZ_DELETE;
+    VirtualRegister(const VirtualRegister&) MOZ_DELETE;
+
+  protected:
+    explicit VirtualRegister(TempAllocator& alloc)
+      : intervals_(alloc)
+    {}
+
   public:
-    bool init(uint32_t id, LBlock *block, LInstruction *ins, LDefinition *def, bool isTemp) {
+    bool init(TempAllocator& alloc, LBlock* block, LInstruction* ins, LDefinition* def,
+              bool isTemp)
+    {
         JS_ASSERT(block && !block_);
-        id_ = id;
         block_ = block;
         ins_ = ins;
         def_ = def;
         isTemp_ = isTemp;
-        LiveInterval *initial = new LiveInterval(def->virtualRegister(), 0);
+        LiveInterval* initial = LiveInterval::New(alloc, def->virtualRegister(), 0);
         if (!initial)
             return false;
         return intervals_.append(initial);
     }
-    uint32_t id() const {
-        return id_;
-    }
-    LBlock *block() {
+    LBlock* block() {
         return block_;
     }
-    LInstruction *ins() {
+    LInstruction* ins() {
         return ins_;
     }
-    LDefinition *def() const {
+    LDefinition* def() const {
         return def_;
     }
     LDefinition::Type type() const {
@@ -399,24 +443,24 @@ class VirtualRegister
     size_t numIntervals() const {
         return intervals_.length();
     }
-    LiveInterval *getInterval(size_t i) const {
+    LiveInterval* getInterval(size_t i) const {
         return intervals_[i];
     }
-    LiveInterval *lastInterval() const {
+    LiveInterval* lastInterval() const {
         JS_ASSERT(numIntervals() > 0);
         return getInterval(numIntervals() - 1);
     }
-    void replaceInterval(LiveInterval *old, LiveInterval *interval) {
+    void replaceInterval(LiveInterval* old, LiveInterval* interval) {
         JS_ASSERT(intervals_[old->index()] == old);
         interval->setIndex(old->index());
         intervals_[old->index()] = interval;
     }
-    bool addInterval(LiveInterval *interval) {
+    bool addInterval(LiveInterval* interval) {
         JS_ASSERT(interval->numRanges());
 
         // Preserve ascending order for faster lookups.
-        LiveInterval **found = NULL;
-        LiveInterval **i;
+        LiveInterval** found = nullptr;
+        LiveInterval** i;
         for (i = intervals_.begin(); i != intervals_.end(); i++) {
             if (!found && interval->start() < (*i)->start())
                 found = i;
@@ -428,12 +472,12 @@ class VirtualRegister
         interval->setIndex(found - intervals_.begin());
         return intervals_.insert(found, interval);
     }
-    bool isDouble() const {
-        return def_->type() == LDefinition::DOUBLE;
+    bool isFloatReg() const {
+        return def_->isFloatReg();
     }
 
-    LiveInterval *intervalFor(CodePosition pos);
-    LiveInterval *getFirstInterval();
+    LiveInterval* intervalFor(CodePosition pos);
+    LiveInterval* getFirstInterval();
 };
 
 // Index of the virtual registers in a graph. VREG is a subclass of
@@ -442,33 +486,39 @@ template <typename VREG>
 class VirtualRegisterMap
 {
   private:
-    VREG *vregs_;
+    VREG* vregs_;
     uint32_t numVregs_;
+
+    void operator=(const VirtualRegisterMap&) MOZ_DELETE;
+    VirtualRegisterMap(const VirtualRegisterMap&) MOZ_DELETE;
 
   public:
     VirtualRegisterMap()
-      : vregs_(NULL),
+      : vregs_(nullptr),
         numVregs_(0)
     { }
 
-    bool init(MIRGenerator *gen, uint32_t numVregs) {
+    bool init(MIRGenerator* gen, uint32_t numVregs) {
         vregs_ = gen->allocate<VREG>(numVregs);
         numVregs_ = numVregs;
         if (!vregs_)
             return false;
         memset(vregs_, 0, sizeof(VREG) * numVregs);
+        TempAllocator& alloc = gen->alloc();
+        for (uint32_t i = 0; i < numVregs; i++)
+            new(&vregs_[i]) VREG(alloc);
         return true;
     }
-    VREG &operator[](unsigned int index) {
+    VREG& operator[](unsigned int index) {
         JS_ASSERT(index < numVregs_);
         return vregs_[index];
     }
-    VREG &operator[](const LAllocation *alloc) {
+    VREG& operator[](const LAllocation* alloc) {
         JS_ASSERT(alloc->isUse());
         JS_ASSERT(alloc->toUse()->virtualRegister() < numVregs_);
         return vregs_[alloc->toUse()->virtualRegister()];
     }
-    VREG &operator[](const LDefinition *def) {
+    VREG& operator[](const LDefinition* def) {
         JS_ASSERT(def->virtualRegister() < numVregs_);
         return vregs_[def->virtualRegister()];
     }
@@ -477,16 +527,8 @@ class VirtualRegisterMap
     }
 };
 
-static inline AnyRegister
-GetFixedRegister(LDefinition *def, LUse *use)
-{
-    return def->type() == LDefinition::DOUBLE
-           ? AnyRegister(FloatRegister::FromCode(use->registerCode()))
-           : AnyRegister(Register::FromCode(use->registerCode()));
-}
-
 static inline bool
-IsNunbox(VirtualRegister *vreg)
+IsNunbox(VirtualRegister* vreg)
 {
 #ifdef JS_NUNBOX32
     return (vreg->type() == LDefinition::TYPE ||
@@ -497,7 +539,13 @@ IsNunbox(VirtualRegister *vreg)
 }
 
 static inline bool
-IsTraceable(VirtualRegister *reg)
+IsSlotsOrElements(VirtualRegister* vreg)
+{
+    return vreg->type() == LDefinition::SLOTS;
+}
+
+static inline bool
+IsTraceable(VirtualRegister* reg)
 {
     if (reg->type() == LDefinition::OBJECT)
         return true;
@@ -511,41 +559,36 @@ IsTraceable(VirtualRegister *reg)
 typedef InlineList<LiveInterval>::iterator IntervalIterator;
 typedef InlineList<LiveInterval>::reverse_iterator IntervalReverseIterator;
 
-template <typename VREG>
-class LiveRangeAllocator : public RegisterAllocator
+// The forLSRA parameter indicates whether the underlying allocator is LSRA.
+// This changes the generated live ranges in various ways: inserting additional
+// fixed uses of registers, and shifting the boundaries of live ranges by small
+// amounts. This exists because different allocators handle live ranges
+// differently; ideally, they would all treat live ranges in the same way.
+template <typename VREG, bool forLSRA>
+class LiveRangeAllocator : protected RegisterAllocator
 {
   protected:
     // Computed inforamtion
-    BitSet **liveIn;
+    BitSet** liveIn;
     VirtualRegisterMap<VREG> vregs;
-    FixedArityList<LiveInterval *, AnyRegister::Total> fixedIntervals;
+    mozilla::Array<LiveInterval*, AnyRegister::Total> fixedIntervals;
 
     // Union of all ranges in fixedIntervals, used to quickly determine
     // whether an interval intersects with a fixed register.
-    LiveInterval *fixedIntervalsUnion;
-
-    // Whether the underlying allocator is LSRA. This changes the generated
-    // live ranges in various ways: inserting additional fixed uses of
-    // registers, and shifting the boundaries of live ranges by small amounts.
-    // This exists because different allocators handle live ranges differently;
-    // ideally, they would all treat live ranges in the same way.
-    bool forLSRA;
+    LiveInterval* fixedIntervalsUnion;
 
     // Allocation state
     StackSlotAllocator stackSlotAllocator;
 
-  public:
-    LiveRangeAllocator(MIRGenerator *mir, LIRGenerator *lir, LIRGraph &graph, bool forLSRA)
+    LiveRangeAllocator(MIRGenerator* mir, LIRGenerator* lir, LIRGraph& graph)
       : RegisterAllocator(mir, lir, graph),
-        liveIn(NULL),
-        fixedIntervalsUnion(NULL),
-        forLSRA(forLSRA)
+        liveIn(nullptr),
+        fixedIntervalsUnion(nullptr)
     {
     }
 
     bool buildLivenessInfo();
 
-  protected:
     bool init();
 
     bool addFixedRangeAtHead(AnyRegister reg, CodePosition from, CodePosition to) {
@@ -557,12 +600,15 @@ class LiveRangeAllocator : public RegisterAllocator
     void validateVirtualRegisters()
     {
 #ifdef DEBUG
-        for (size_t i = 1; i < graph.numVirtualRegisters(); i++) {
-            VirtualRegister *reg = &vregs[i];
+        if (!js_JitOptions.checkGraphConsistency)
+            return;
 
-            LiveInterval *prev = NULL;
+        for (size_t i = 1; i < graph.numVirtualRegisters(); i++) {
+            VirtualRegister* reg = &vregs[i];
+
+            LiveInterval* prev = nullptr;
             for (size_t j = 0; j < reg->numIntervals(); j++) {
-                LiveInterval *interval = reg->getInterval(j);
+                LiveInterval* interval = reg->getInterval(j);
                 JS_ASSERT(interval->vreg() == i);
                 JS_ASSERT(interval->index() == j);
 
@@ -579,66 +625,107 @@ class LiveRangeAllocator : public RegisterAllocator
     }
 
 #ifdef JS_NUNBOX32
-    VREG *otherHalfOfNunbox(VirtualRegister *vreg) {
+    VREG* otherHalfOfNunbox(VirtualRegister* vreg) {
         signed offset = OffsetToOtherHalfOfNunbox(vreg->type());
-        VREG *other = &vregs[vreg->def()->virtualRegister() + offset];
+        VREG* other = &vregs[vreg->def()->virtualRegister() + offset];
         AssertTypesFormANunbox(vreg->type(), other->type());
         return other;
     }
 #endif
 
-    bool addMove(LMoveGroup *moves, LiveInterval *from, LiveInterval *to) {
+    bool addMove(LMoveGroup* moves, LiveInterval* from, LiveInterval* to, LDefinition::Type type) {
+        JS_ASSERT(*from->getAllocation() != *to->getAllocation());
+        return moves->add(from->getAllocation(), to->getAllocation(), type);
+    }
+
+    bool moveInput(CodePosition pos, LiveInterval* from, LiveInterval* to, LDefinition::Type type) {
         if (*from->getAllocation() == *to->getAllocation())
             return true;
-        return moves->add(from->getAllocation(), to->getAllocation());
+        LMoveGroup* moves = getInputMoveGroup(pos);
+        return addMove(moves, from, to, type);
     }
 
-    bool moveInput(CodePosition pos, LiveInterval *from, LiveInterval *to) {
-        LMoveGroup *moves = getInputMoveGroup(pos);
-        return addMove(moves, from, to);
+    bool moveAfter(CodePosition pos, LiveInterval* from, LiveInterval* to, LDefinition::Type type) {
+        if (*from->getAllocation() == *to->getAllocation())
+            return true;
+        LMoveGroup* moves = getMoveGroupAfter(pos);
+        return addMove(moves, from, to, type);
     }
 
-    bool moveAfter(CodePosition pos, LiveInterval *from, LiveInterval *to) {
-        LMoveGroup *moves = getMoveGroupAfter(pos);
-        return addMove(moves, from, to);
+    bool moveAtExit(LBlock* block, LiveInterval* from, LiveInterval* to, LDefinition::Type type) {
+        if (*from->getAllocation() == *to->getAllocation())
+            return true;
+        LMoveGroup* moves = block->getExitMoveGroup(alloc());
+        return addMove(moves, from, to, type);
     }
 
-    void addLiveRegistersForInterval(VirtualRegister *reg, LiveInterval *interval)
+    bool moveAtEntry(LBlock* block, LiveInterval* from, LiveInterval* to, LDefinition::Type type) {
+        if (*from->getAllocation() == *to->getAllocation())
+            return true;
+        LMoveGroup* moves = block->getEntryMoveGroup(alloc());
+        return addMove(moves, from, to, type);
+    }
+
+    size_t findFirstNonCallSafepoint(CodePosition from) const
+    {
+        size_t i = 0;
+        for (; i < graph.numNonCallSafepoints(); i++) {
+            const LInstruction* ins = graph.getNonCallSafepoint(i);
+            if (from <= inputOf(ins))
+                break;
+        }
+        return i;
+    }
+
+    void addLiveRegistersForInterval(VirtualRegister* reg, LiveInterval* interval)
     {
         // Fill in the live register sets for all non-call safepoints.
-        LAllocation *a = interval->getAllocation();
+        LAllocation* a = interval->getAllocation();
         if (!a->isRegister())
             return;
 
         // Don't add output registers to the safepoint.
         CodePosition start = interval->start();
-        if (interval->index() == 0 && !reg->isTemp())
+        if (interval->index() == 0 && !reg->isTemp()) {
+#ifdef CHECK_OSIPOINT_REGISTERS
+            // We don't add the output register to the safepoint,
+            // but it still might get added as one of the inputs.
+            // So eagerly add this reg to the safepoint clobbered registers.
+            if (LSafepoint* safepoint = reg->ins()->safepoint())
+                safepoint->addClobberedRegister(a->toRegister());
+#endif
             start = start.next();
+        }
 
         size_t i = findFirstNonCallSafepoint(start);
         for (; i < graph.numNonCallSafepoints(); i++) {
-            LInstruction *ins = graph.getNonCallSafepoint(i);
+            LInstruction* ins = graph.getNonCallSafepoint(i);
             CodePosition pos = inputOf(ins);
 
             // Safepoints are sorted, so we can shortcut out of this loop
             // if we go out of range.
-            if (interval->end() < pos)
+            if (interval->end() <= pos)
                 break;
 
             if (!interval->covers(pos))
                 continue;
 
-            LSafepoint *safepoint = ins->safepoint();
+            LSafepoint* safepoint = ins->safepoint();
             safepoint->addLiveRegister(a->toRegister());
+
+#ifdef CHECK_OSIPOINT_REGISTERS
+            if (reg->isTemp())
+                safepoint->addClobberedRegister(a->toRegister());
+#endif
         }
     }
 
     // Finds the first safepoint that is within range of an interval.
-    size_t findFirstSafepoint(const LiveInterval *interval, size_t startFrom) const
+    size_t findFirstSafepoint(const LiveInterval* interval, size_t startFrom) const
     {
         size_t i = startFrom;
         for (; i < graph.numSafepoints(); i++) {
-            LInstruction *ins = graph.getSafepoint(i);
+            LInstruction* ins = graph.getSafepoint(i);
             if (interval->start() <= inputOf(ins))
                 break;
         }

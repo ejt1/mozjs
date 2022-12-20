@@ -8,18 +8,17 @@
 
 #include "js/PropertyKey.h"
 
+#include "jsatom.h"
+#include "jscntxt.h"
+
 #include "js/RootingAPI.h"
 #include "js/Value.h"
 #include "vm/String.h"
 
-#include "jsatominlines.h"
-
-#include "vm/String-inl.h"
-
 using namespace js;
 
 bool
-JS::detail::ToPropertyKeySlow(JSContext *cx, HandleValue v, PropertyKey *key)
+JS::detail::ToPropertyKeySlow(JSContext* cx, HandleValue v, PropertyKey* key)
 {
     MOZ_ASSERT_IF(v.isInt32(), v.toInt32() < 0);
 

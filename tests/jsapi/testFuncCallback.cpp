@@ -3,8 +3,6 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "tests.h"
-#include "jsfun.h"
-#include "jscntxt.h"
 
 #ifdef MOZ_TRACE_JSCALLS
 
@@ -14,9 +12,9 @@ static int leaves = 0;
 static int interpreted = 0;
 
 static void
-funcTransition(const JSFunction *,
-               const JSScript *,
-               const JSContext *cx,
+funcTransition(const JSFunction*,
+               const JSScript*,
+               const JSContext* cx,
                int entering)
 {
     if (entering > 0) {
@@ -29,20 +27,20 @@ funcTransition(const JSFunction *,
     }
 }
 
-static JSBool called2 = false;
+static bool called2 = false;
 
 static void
-funcTransition2(const JSFunction *, const JSScript*, const JSContext*, int)
+funcTransition2(const JSFunction*, const JSScript*, const JSContext*, int)
 {
     called2 = true;
 }
 
 static int overlays = 0;
-static JSFunctionCallback innerCallback = NULL;
+static JSFunctionCallback innerCallback = nullptr;
 static void
-funcTransitionOverlay(const JSFunction *fun,
-                      const JSScript *script,
-                      const JSContext *cx,
+funcTransitionOverlay(const JSFunction* fun,
+                      const JSScript* script,
+                      const JSContext* cx,
                       int entering)
 {
     (*innerCallback)(fun, script, cx, entering);
@@ -80,7 +78,7 @@ BEGIN_TEST(testFuncCallback_bug507012)
     CHECK_EQUAL(enters, 777);
 
     // Check whether we can turn off function tracing
-    JS_SetFunctionCallback(cx, NULL);
+    JS_SetFunctionCallback(cx, nullptr);
     EXEC("f(1)");
     CHECK_EQUAL(enters, 777);
     interpreted = enters = leaves = depth = 0;
@@ -130,11 +128,13 @@ BEGIN_TEST(testFuncCallback_bug507012)
 // Make sure that the method jit is enabled.
 // We'll probably want to test in all modes.
 virtual
-JSContext *createContext()
+JSContext* createContext()
 {
-    JSContext *cx = JSAPITest::createContext();
-    if (cx)
-        JS_SetOptions(cx, JS_GetOptions(cx) | JSOPTION_BASELINE | JSOPTION_ION | JSOPTION_PCCOUNT);
+    JSContext* cx = JSAPITest::createContext();
+    if (!cx)
+        return nullptr;
+    JS::RuntimeOptionsRef(cx).setBaseline(true)
+                             .setIon(true);
     return cx;
 }
 

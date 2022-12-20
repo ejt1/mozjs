@@ -4,19 +4,88 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "jit/LICM.h"
+
 #include <stdio.h>
 
-#include "Ion.h"
-#include "IonBuilder.h"
-#include "IonSpewer.h"
-#include "LICM.h"
-#include "MIR.h"
-#include "MIRGraph.h"
+#include "jit/IonSpewer.h"
+#include "jit/MIR.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
 
 using namespace js;
 using namespace js::jit;
 
-LICM::LICM(MIRGenerator *mir, MIRGraph &graph)
+namespace {
+
+typedef Vector<MInstruction*, 1, IonAllocPolicy> InstructionQueue;
+
+class Loop
+{
+    MIRGenerator* mir;
+
+  public:
+    // Loop code may return three values:
+    enum LoopReturn {
+        LoopReturn_Success,
+        LoopReturn_Error, // Compilation failure.
+        LoopReturn_Skip   // The loop is not suitable for LICM, but there is no error.
+    };
+
+  public:
+    // A loop is constructed on a backedge found in the control flow graph.
+    Loop(MIRGenerator* mir, MBasicBlock* footer);
+
+    // Initializes the loop, finds all blocks and instructions contained in the loop.
+    LoopReturn init();
+
+    // Identifies hoistable loop invariant instructions and moves them out of the loop.
+    bool optimize();
+
+  private:
+    // These blocks define the loop.  header_ points to the loop header
+    MBasicBlock* header_;
+
+    // The pre-loop block is the first predecessor of the loop header.  It is where
+    // the loop is first entered and where hoisted instructions will be placed.
+    MBasicBlock* preLoop_;
+
+    // This indicates whether the loop contains calls or other things which
+    // clobber most or all floating-point registers. In such loops,
+    // floating-point constants should not be hoisted unless it enables further
+    // hoisting.
+    bool containsPossibleCall_;
+
+    TempAllocator& alloc() const {
+        return mir->alloc();
+    }
+
+    bool hoistInstructions(InstructionQueue& toHoist);
+
+    // Utility methods for invariance testing and instruction hoisting.
+    bool isInLoop(MDefinition* ins);
+    bool isBeforeLoop(MDefinition* ins);
+    bool isLoopInvariant(MInstruction* ins);
+
+    // This method determines if this block hot within a loop.  That is, if it's
+    // always or usually run when the loop executes
+    bool checkHotness(MBasicBlock* block);
+
+    // Worklist and worklist usage methods
+    InstructionQueue worklist_;
+    bool insertInWorklist(MInstruction* ins);
+    MInstruction* popFromWorklist();
+
+    inline bool isHoistable(const MDefinition* ins) const {
+        return ins->isMovable() && !ins->isEffectful() && !ins->neverHoist();
+    }
+
+    bool requiresHoistedUse(const MDefinition* ins) const;
+};
+
+} /* namespace anonymous */
+
+LICM::LICM(MIRGenerator* mir, MIRGraph& graph)
   : mir(mir), graph(graph)
 {
 }
@@ -28,7 +97,7 @@ LICM::analyze()
 
     // Iterate in RPO to visit outer loops before inner loops.
     for (ReversePostorderIterator i(graph.rpoBegin()); i != graph.rpoEnd(); i++) {
-        MBasicBlock *header = *i;
+        MBasicBlock* header = *i;
 
         // Skip non-headers and self-loops.
         if (!header->isLoopHeader() || header->numPredecessors() < 2)
@@ -54,9 +123,11 @@ LICM::analyze()
     return true;
 }
 
-Loop::Loop(MIRGenerator *mir, MBasicBlock *header)
+Loop::Loop(MIRGenerator* mir, MBasicBlock* header)
   : mir(mir),
-    header_(header)
+    header_(header),
+    containsPossibleCall_(false),
+    worklist_(mir->alloc())
 {
     preLoop_ = header_->getPredecessor(0);
 }
@@ -73,13 +144,13 @@ Loop::init()
     // Loops from backedge to header and marks all visited blocks
     // as part of the loop. At the same time add all hoistable instructions
     // (in RPO order) to the instruction worklist.
-    Vector<MBasicBlock *, 1, IonAllocPolicy> inlooplist;
+    Vector<MBasicBlock*, 1, IonAllocPolicy> inlooplist(alloc());
     if (!inlooplist.append(header_->backedge()))
         return LoopReturn_Error;
     header_->backedge()->mark();
 
     while (!inlooplist.empty()) {
-        MBasicBlock *block = inlooplist.back();
+        MBasicBlock* block = inlooplist.back();
 
         // Hoisting requires more finesse if the loop contains a block that
         // self-dominates: there exists control flow that may enter the loop
@@ -96,7 +167,7 @@ Loop::init()
         // Add not yet visited predecessors to the inlooplist.
         if (block != header_) {
             for (size_t i = 0; i < block->numPredecessors(); i++) {
-                MBasicBlock *pred = block->getPredecessor(i);
+                MBasicBlock* pred = block->getPredecessor(i);
                 if (pred->isMarked())
                     continue;
 
@@ -112,7 +183,12 @@ Loop::init()
 
         // Add all instructions in this block (but the control instruction) to the worklist
         for (MInstructionIterator i = block->begin(); i != block->end(); i++) {
-            MInstruction *ins = *i;
+            MInstruction* ins = *i;
+
+            // Remember whether this loop contains anything which clobbers most
+            // or all floating-point registers. This is just a rough heuristic.
+            if (ins->possiblyCalls())
+                containsPossibleCall_ = true;
 
             if (isHoistable(ins)) {
                 if (!insertInWorklist(ins))
@@ -130,7 +206,7 @@ Loop::init()
 bool
 Loop::optimize()
 {
-    InstructionQueue invariantInstructions;
+    InstructionQueue invariantInstructions(alloc());
 
     IonSpew(IonSpew_LICM, "These instructions are in the loop: ");
 
@@ -138,7 +214,7 @@ Loop::optimize()
         if (mir->shouldCancel("LICM (worklist)"))
             return false;
 
-        MInstruction *ins = popFromWorklist();
+        MInstruction* ins = popFromWorklist();
 
         IonSpewHeader(IonSpew_LICM);
 
@@ -166,16 +242,32 @@ Loop::optimize()
 }
 
 bool
-Loop::hoistInstructions(InstructionQueue &toHoist)
+Loop::requiresHoistedUse(const MDefinition* ins) const
+{
+    if (ins->isConstantElements() || ins->isBox())
+        return true;
+
+    // Integer constants can often be folded as immediates and aren't worth
+    // hoisting on their own, in general. Floating-point constants typically
+    // are worth hoisting, unless they'll end up being spilled (eg. due to a
+    // call).
+    if (ins->isConstant() && (IsFloatingPointType(ins->type()) || containsPossibleCall_))
+        return true;
+
+    return false;
+}
+
+bool
+Loop::hoistInstructions(InstructionQueue& toHoist)
 {
     // Iterate in post-order (uses before definitions)
     for (int32_t i = toHoist.length() - 1; i >= 0; i--) {
-        MInstruction *ins = toHoist[i];
+        MInstruction* ins = toHoist[i];
 
-        // Don't hoist MConstantElements, MConstant and MBox
-        // if it doesn't enable us to hoist one of its uses.
-        // We want those instructions as close as possible to their use.
-        if (ins->isConstantElements() || ins->isConstant() || ins->isBox()) {
+        // Don't hoist a cheap constant if it doesn't enable us to hoist one of
+        // its uses. We want those instructions as close as possible to their
+        // use, to facilitate folding and minimize register pressure.
+        if (requiresHoistedUse(ins)) {
             bool loopInvariantUse = false;
             for (MUseDefIterator use(ins); use; use++) {
                 if (use.def()->isLoopInvariant()) {
@@ -191,7 +283,7 @@ Loop::hoistInstructions(InstructionQueue &toHoist)
 
     // Move all instructions to the preLoop_ block just before the control instruction.
     for (size_t i = 0; i < toHoist.length(); i++) {
-        MInstruction *ins = toHoist[i];
+        MInstruction* ins = toHoist[i];
 
         // Loads may have an implicit dependency on either stores (effectful instructions) or
         // control instructions so we should never move these.
@@ -212,19 +304,19 @@ Loop::hoistInstructions(InstructionQueue &toHoist)
 }
 
 bool
-Loop::isInLoop(MDefinition *ins)
+Loop::isInLoop(MDefinition* ins)
 {
     return ins->block()->isMarked();
 }
 
 bool
-Loop::isBeforeLoop(MDefinition *ins)
+Loop::isBeforeLoop(MDefinition* ins)
 {
     return ins->block()->id() < header_->id();
 }
 
 bool
-Loop::isLoopInvariant(MInstruction *ins)
+Loop::isLoopInvariant(MInstruction* ins)
 {
     if (!isHoistable(ins)) {
         if (IonSpewEnabled(IonSpew_LICM))
@@ -247,7 +339,7 @@ Loop::isLoopInvariant(MInstruction *ins)
 
     // An instruction is only loop invariant if it and all of its operands can
     // be safely hoisted into the loop preheader.
-    for (size_t i = 0; i < ins->numOperands(); i ++) {
+    for (size_t i = 0, e = ins->numOperands(); i < e; i++) {
         if (isInLoop(ins->getOperand(i)) &&
             !ins->getOperand(i)->isLoopInvariant()) {
 
@@ -264,16 +356,7 @@ Loop::isLoopInvariant(MInstruction *ins)
 }
 
 bool
-Loop::isLoopInvariant(MDefinition *ins)
-{
-    if (!isInLoop(ins))
-        return true;
-
-    return ins->isInstruction() && isLoopInvariant(ins->toInstruction());
-}
-
-bool
-Loop::checkHotness(MBasicBlock *block)
+Loop::checkHotness(MBasicBlock* block)
 {
     // TODO: determine if instructions within this block are worth hoisting.
     // They might not be if the block is cold enough within the loop.
@@ -282,7 +365,7 @@ Loop::checkHotness(MBasicBlock *block)
 }
 
 bool
-Loop::insertInWorklist(MInstruction *ins)
+Loop::insertInWorklist(MInstruction* ins)
 {
     if (!worklist_.insert(worklist_.begin(), ins))
         return false;

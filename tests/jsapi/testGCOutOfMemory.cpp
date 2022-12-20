@@ -7,12 +7,11 @@
  */
 
 #include "tests.h"
-#include "jscntxt.h"
 
 static unsigned errorCount = 0;
 
 static void
-ErrorCounter(JSContext *cx, const char *message, JSErrorReport *report)
+ErrorCounter(JSContext* cx, const char* message, JSErrorReport* report)
 {
     ++errorCount;
 }
@@ -30,8 +29,7 @@ BEGIN_TEST(testGCOutOfMemory)
         "        array.push({});"
         "    array = []; array.push(0);"
         "})();";
-    JSBool ok = JS_EvaluateScript(cx, global, source, strlen(source), "", 1,
-                                  root.address());
+    bool ok = JS_EvaluateScript(cx, global, source, strlen(source), "", 1, &root);
 
     /* Check that we get OOM. */
     CHECK(!ok);
@@ -48,13 +46,17 @@ BEGIN_TEST(testGCOutOfMemory)
          "        --i;"
          "        array.push({});"
          "    }"
-         "})();", root.address());
+         "})();", &root);
     CHECK_EQUAL(errorCount, 1);
     return true;
 }
 
 virtual JSRuntime * createRuntime() {
-    return JS_NewRuntime(768 * 1024, JS_USE_HELPER_THREADS);
+    JSRuntime* rt = JS_NewRuntime(768 * 1024, JS_USE_HELPER_THREADS);
+    if (!rt)
+        return nullptr;
+    setNativeStackQuota(rt);
+    return rt;
 }
 
 virtual void destroyRuntime() {

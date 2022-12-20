@@ -8,27 +8,29 @@
 
 #include "jsreflect.h"
 
+#include "mozilla/ArrayUtils.h"
+#include "mozilla/DebugOnly.h"
+
 #include <stdlib.h>
 
-#include "mozilla/DebugOnly.h"
-#include "mozilla/Util.h"
-
-#include "jspubtd.h"
 #include "jsarray.h"
 #include "jsatom.h"
 #include "jsobj.h"
+#include "jspubtd.h"
 
 #include "frontend/Parser.h"
-#include "frontend/ParseNode-inl.h"
 #include "frontend/TokenStream.h"
 #include "js/CharacterEncoding.h"
 #include "vm/RegExpObject.h"
 
 #include "jsobjinlines.h"
 
+#include "frontend/ParseNode-inl.h"
+
 using namespace js;
 using namespace js::frontend;
 
+using JS::AutoValueArray;
 using mozilla::ArrayLength;
 using mozilla::DebugOnly;
 
@@ -85,15 +87,17 @@ char const * const js::nodeTypeNames[] = {
 #define ASTDEF(ast, str, method) str,
 #include "jsast.tbl"
 #undef ASTDEF
-    NULL
+    nullptr
 };
 
 static char const * const callbackNames[] = {
 #define ASTDEF(ast, str, method) method,
 #include "jsast.tbl"
 #undef ASTDEF
-    NULL
+    nullptr
 };
+
+enum YieldKind { Delegating, NotDelegating };
 
 typedef AutoValueVector NodeVector;
 
@@ -103,21 +107,38 @@ typedef AutoValueVector NodeVector;
  * parser and the AST serializer. We use these macros to check invariants on a
  * parse node and raise a dynamic error on failure.
  */
-#define LOCAL_ASSERT(expr)                                                             \
-    JS_BEGIN_MACRO                                                                     \
-        JS_ASSERT(expr);                                                               \
-        if (!(expr)) {                                                                 \
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_BAD_PARSE_NODE);  \
-            return false;                                                              \
-        }                                                                              \
+#define LOCAL_ASSERT(expr)                                                                \
+    JS_BEGIN_MACRO                                                                        \
+        JS_ASSERT(expr);                                                                  \
+        if (!(expr)) {                                                                    \
+            JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_BAD_PARSE_NODE);  \
+            return false;                                                                 \
+        }                                                                                 \
     JS_END_MACRO
 
-#define LOCAL_NOT_REACHED(expr)                                                        \
-    JS_BEGIN_MACRO                                                                     \
-        JS_NOT_REACHED(expr);                                                          \
-        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_BAD_PARSE_NODE);      \
-        return false;                                                                  \
+#define LOCAL_NOT_REACHED(expr)                                                           \
+    JS_BEGIN_MACRO                                                                        \
+        MOZ_ASSERT(false);                                                                \
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_BAD_PARSE_NODE);      \
+        return false;                                                                     \
     JS_END_MACRO
+
+namespace {
+
+/* Set 'result' to obj[id] if any such property exists, else defaultValue. */
+static bool
+GetPropertyDefault(JSContext* cx, HandleObject obj, HandleId id, HandleValue defaultValue,
+                   MutableHandleValue result)
+{
+    bool found;
+    if (!JSObject::hasProperty(cx, obj, id, &found))
+        return false;
+    if (!found) {
+        result.set(defaultValue);
+        return true;
+    }
+    return JSObject::getGeneric(cx, obj, obj, id, result);
+}
 
 /*
  * Builder class that constructs JavaScript AST node objects. See:
@@ -128,25 +149,23 @@ typedef AutoValueVector NodeVector;
  */
 class NodeBuilder
 {
-    JSContext   *cx;
-    TokenStream *tokenStream;
+    typedef AutoValueArray<AST_LIMIT> CallbackArray;
+
+    JSContext*  cx;
+    TokenStream* tokenStream;
     bool        saveLoc;               /* save source location information?     */
-    char const  *src;                  /* source filename or null               */
+    char const* src;                  /* source filename or null               */
     RootedValue srcval;                /* source filename JS value or null      */
-    Value       callbacks[AST_LIMIT];  /* user-specified callbacks              */
-    AutoValueArray callbacksRoots;     /* for rooting |callbacks|               */
+    CallbackArray callbacks;           /* user-specified callbacks              */
     RootedValue userv;                 /* user-specified builder object or null */
-    RootedValue undefinedVal;          /* a rooted undefined val, used by opt() */
 
   public:
-    NodeBuilder(JSContext *c, bool l, char const *s)
-        : cx(c), tokenStream(NULL), saveLoc(l), src(s), srcval(c),
-          callbacksRoots(c, callbacks, AST_LIMIT), userv(c), undefinedVal(c, UndefinedValue())
-    {
-        MakeRangeGCSafe(callbacks, mozilla::ArrayLength(callbacks));
-    }
+    NodeBuilder(JSContext* c, bool l, char const* s)
+      : cx(c), tokenStream(nullptr), saveLoc(l), src(s), srcval(c), callbacks(cx),
+          userv(c)
+    {}
 
-    bool init(HandleObject userobj = NullPtr()) {
+    bool init(HandleObject userobj = js::NullPtr()) {
         if (src) {
             if (!atomValue(src, &srcval))
                 return false;
@@ -167,12 +186,12 @@ class NodeBuilder
         RootedValue nullVal(cx, NullValue());
         RootedValue funv(cx);
         for (unsigned i = 0; i < AST_LIMIT; i++) {
-            const char *name = callbackNames[i];
+            const char* name = callbackNames[i];
             RootedAtom atom(cx, Atomize(cx, name, strlen(name)));
             if (!atom)
                 return false;
             RootedId id(cx, AtomToId(atom));
-            if (!baseops::GetPropertyDefault(cx, userobj, id, nullVal, &funv))
+            if (!GetPropertyDefault(cx, userobj, id, nullVal, &funv))
                 return false;
 
             if (funv.isNullOrUndefined()) {
@@ -182,125 +201,150 @@ class NodeBuilder
 
             if (!funv.isObject() || !funv.toObject().is<JSFunction>()) {
                 js_ReportValueErrorFlags(cx, JSREPORT_ERROR, JSMSG_NOT_FUNCTION,
-                                         JSDVG_SEARCH_STACK, funv, NullPtr(), NULL, NULL);
+                                         JSDVG_SEARCH_STACK, funv, js::NullPtr(), nullptr, nullptr);
                 return false;
             }
 
-            callbacks[i] = funv;
+            callbacks[i].set(funv);
         }
 
         return true;
     }
 
-    void setTokenStream(TokenStream *ts) {
+    void setTokenStream(TokenStream* ts) {
         tokenStream = ts;
     }
 
   private:
-    bool callback(HandleValue fun, TokenPos *pos, MutableHandleValue dst) {
+    bool callback(HandleValue fun, TokenPos* pos, MutableHandleValue dst) {
         if (saveLoc) {
             RootedValue loc(cx);
             if (!newNodeLoc(pos, &loc))
                 return false;
-            Value argv[] = { loc };
-            AutoValueArray ava(cx, argv, 1);
-            return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+            AutoValueArray<1> argv(cx);
+            argv[0].set(loc);
+            return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
         }
 
-        Value argv[] = { NullValue() }; /* no zero-length arrays allowed! */
-        AutoValueArray ava(cx, argv, 1);
-        return Invoke(cx, userv, fun, 0, argv, dst.address());
+        AutoValueArray<1> argv(cx);
+        argv[0].setNull(); /* no zero-length arrays allowed! */
+        return Invoke(cx, userv, fun, 0, argv.begin(), dst);
     }
 
-    bool callback(HandleValue fun, HandleValue v1, TokenPos *pos, MutableHandleValue dst) {
+    bool callback(HandleValue fun, HandleValue v1, TokenPos* pos, MutableHandleValue dst) {
         if (saveLoc) {
             RootedValue loc(cx);
             if (!newNodeLoc(pos, &loc))
                 return false;
-            Value argv[] = { v1, loc };
-            AutoValueArray ava(cx, argv, 2);
-            return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+            AutoValueArray<2> argv(cx);
+            argv[0].set(v1);
+            argv[1].set(loc);
+            return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
         }
 
-        Value argv[] = { v1 };
-        AutoValueArray ava(cx, argv, 1);
-        return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+        AutoValueArray<1> argv(cx);
+        argv[0].set(v1);
+        return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
     }
 
-    bool callback(HandleValue fun, HandleValue v1, HandleValue v2, TokenPos *pos,
+    bool callback(HandleValue fun, HandleValue v1, HandleValue v2, TokenPos* pos,
                   MutableHandleValue dst) {
         if (saveLoc) {
             RootedValue loc(cx);
             if (!newNodeLoc(pos, &loc))
                 return false;
-            Value argv[] = { v1, v2, loc };
-            AutoValueArray ava(cx, argv, 3);
-            return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+            AutoValueArray<3> argv(cx);
+            argv[0].set(v1);
+            argv[1].set(v2);
+            argv[2].set(loc);
+            return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
         }
 
-        Value argv[] = { v1, v2 };
-        AutoValueArray ava(cx, argv, 2);
-        return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+        AutoValueArray<2> argv(cx);
+        argv[0].set(v1);
+        argv[1].set(v2);
+        return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
     }
 
-    bool callback(HandleValue fun, HandleValue v1, HandleValue v2, HandleValue v3, TokenPos *pos,
+    bool callback(HandleValue fun, HandleValue v1, HandleValue v2, HandleValue v3, TokenPos* pos,
                   MutableHandleValue dst) {
         if (saveLoc) {
             RootedValue loc(cx);
             if (!newNodeLoc(pos, &loc))
                 return false;
-            Value argv[] = { v1, v2, v3, loc };
-            AutoValueArray ava(cx, argv, 4);
-            return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+            AutoValueArray<4> argv(cx);
+            argv[0].set(v1);
+            argv[1].set(v2);
+            argv[2].set(v3);
+            argv[3].set(loc);
+            return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
         }
 
-        Value argv[] = { v1, v2, v3 };
-        AutoValueArray ava(cx, argv, 3);
-        return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+        AutoValueArray<3> argv(cx);
+        argv[0].set(v1);
+        argv[1].set(v2);
+        argv[2].set(v3);
+        return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
     }
 
     bool callback(HandleValue fun, HandleValue v1, HandleValue v2, HandleValue v3, HandleValue v4,
-                  TokenPos *pos, MutableHandleValue dst) {
+                  TokenPos* pos, MutableHandleValue dst) {
         if (saveLoc) {
             RootedValue loc(cx);
             if (!newNodeLoc(pos, &loc))
                 return false;
-            Value argv[] = { v1, v2, v3, v4, loc };
-            AutoValueArray ava(cx, argv, 5);
-            return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+            AutoValueArray<5> argv(cx);
+            argv[0].set(v1);
+            argv[1].set(v2);
+            argv[2].set(v3);
+            argv[3].set(v4);
+            argv[4].set(loc);
+            return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
         }
 
-        Value argv[] = { v1, v2, v3, v4 };
-        AutoValueArray ava(cx, argv, 4);
-        return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+        AutoValueArray<4> argv(cx);
+        argv[0].set(v1);
+        argv[1].set(v2);
+        argv[2].set(v3);
+        argv[3].set(v4);
+        return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
     }
 
     bool callback(HandleValue fun, HandleValue v1, HandleValue v2, HandleValue v3, HandleValue v4,
-                  HandleValue v5, TokenPos *pos, MutableHandleValue dst) {
+                  HandleValue v5, TokenPos* pos, MutableHandleValue dst) {
         if (saveLoc) {
             RootedValue loc(cx);
             if (!newNodeLoc(pos, &loc))
                 return false;
-            Value argv[] = { v1, v2, v3, v4, v5, loc };
-            AutoValueArray ava(cx, argv, 6);
-            return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+            AutoValueArray<6> argv(cx);
+            argv[0].set(v1);
+            argv[1].set(v2);
+            argv[2].set(v3);
+            argv[3].set(v4);
+            argv[4].set(v5);
+            argv[5].set(loc);
+            return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
         }
 
-        Value argv[] = { v1, v2, v3, v4, v5 };
-        AutoValueArray ava(cx, argv, 5);
-        return Invoke(cx, userv, fun, ArrayLength(argv), argv, dst.address());
+        AutoValueArray<5> argv(cx);
+        argv[0].set(v1);
+        argv[1].set(v2);
+        argv[2].set(v3);
+        argv[3].set(v4);
+        argv[4].set(v5);
+        return Invoke(cx, userv, fun, argv.length(), argv.begin(), dst);
     }
 
     // WARNING: Returning a Handle is non-standard, but it works in this case
-    // because both |v| and |undefinedVal| are definitely rooted on a previous
-    // stack frame (i.e. we're just choosing between two already-rooted
-    // values).
+    // because both |v| and |UndefinedHandleValue| are definitely rooted on a
+    // previous stack frame (i.e. we're just choosing between two
+    // already-rooted values).
     HandleValue opt(HandleValue v) {
         JS_ASSERT_IF(v.isMagic(), v.whyMagic() == JS_SERIALIZE_NO_NODE);
-        return v.isMagic(JS_SERIALIZE_NO_NODE) ? undefinedVal : v;
+        return v.isMagic(JS_SERIALIZE_NO_NODE) ? JS::UndefinedHandleValue : v;
     }
 
-    bool atomValue(const char *s, MutableHandleValue dst) {
+    bool atomValue(const char* s, MutableHandleValue dst) {
         /*
          * Bug 575416: instead of Atomize, lookup constant atoms in tbl file
          */
@@ -313,7 +357,7 @@ class NodeBuilder
     }
 
     bool newObject(MutableHandleObject dst) {
-        RootedObject nobj(cx, NewBuiltinClassInstance(cx, &ObjectClass));
+        RootedObject nobj(cx, NewBuiltinClassInstance(cx, &JSObject::class_));
         if (!nobj)
             return false;
 
@@ -321,18 +365,18 @@ class NodeBuilder
         return true;
     }
 
-    bool newArray(NodeVector &elts, MutableHandleValue dst);
+    bool newArray(NodeVector& elts, MutableHandleValue dst);
 
-    bool newNode(ASTType type, TokenPos *pos, MutableHandleObject dst);
+    bool newNode(ASTType type, TokenPos* pos, MutableHandleObject dst);
 
-    bool newNode(ASTType type, TokenPos *pos, MutableHandleValue dst) {
+    bool newNode(ASTType type, TokenPos* pos, MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
                setResult(node, dst);
     }
 
-    bool newNode(ASTType type, TokenPos *pos,
-                 const char *childName, HandleValue child,
+    bool newNode(ASTType type, TokenPos* pos,
+                 const char* childName, HandleValue child,
                  MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
@@ -340,9 +384,9 @@ class NodeBuilder
                setResult(node, dst);
     }
 
-    bool newNode(ASTType type, TokenPos *pos,
-                 const char *childName1, HandleValue child1,
-                 const char *childName2, HandleValue child2,
+    bool newNode(ASTType type, TokenPos* pos,
+                 const char* childName1, HandleValue child1,
+                 const char* childName2, HandleValue child2,
                  MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
@@ -351,10 +395,10 @@ class NodeBuilder
                setResult(node, dst);
     }
 
-    bool newNode(ASTType type, TokenPos *pos,
-                 const char *childName1, HandleValue child1,
-                 const char *childName2, HandleValue child2,
-                 const char *childName3, HandleValue child3,
+    bool newNode(ASTType type, TokenPos* pos,
+                 const char* childName1, HandleValue child1,
+                 const char* childName2, HandleValue child2,
+                 const char* childName3, HandleValue child3,
                  MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
@@ -364,11 +408,11 @@ class NodeBuilder
                setResult(node, dst);
     }
 
-    bool newNode(ASTType type, TokenPos *pos,
-                 const char *childName1, HandleValue child1,
-                 const char *childName2, HandleValue child2,
-                 const char *childName3, HandleValue child3,
-                 const char *childName4, HandleValue child4,
+    bool newNode(ASTType type, TokenPos* pos,
+                 const char* childName1, HandleValue child1,
+                 const char* childName2, HandleValue child2,
+                 const char* childName3, HandleValue child3,
+                 const char* childName4, HandleValue child4,
                  MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
@@ -379,12 +423,12 @@ class NodeBuilder
                setResult(node, dst);
     }
 
-    bool newNode(ASTType type, TokenPos *pos,
-                 const char *childName1, HandleValue child1,
-                 const char *childName2, HandleValue child2,
-                 const char *childName3, HandleValue child3,
-                 const char *childName4, HandleValue child4,
-                 const char *childName5, HandleValue child5,
+    bool newNode(ASTType type, TokenPos* pos,
+                 const char* childName1, HandleValue child1,
+                 const char* childName2, HandleValue child2,
+                 const char* childName3, HandleValue child3,
+                 const char* childName4, HandleValue child4,
+                 const char* childName5, HandleValue child5,
                  MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
@@ -396,14 +440,14 @@ class NodeBuilder
                setResult(node, dst);
     }
 
-    bool newNode(ASTType type, TokenPos *pos,
-                 const char *childName1, HandleValue child1,
-                 const char *childName2, HandleValue child2,
-                 const char *childName3, HandleValue child3,
-                 const char *childName4, HandleValue child4,
-                 const char *childName5, HandleValue child5,
-                 const char *childName6, HandleValue child6,
-                 const char *childName7, HandleValue child7,
+    bool newNode(ASTType type, TokenPos* pos,
+                 const char* childName1, HandleValue child1,
+                 const char* childName2, HandleValue child2,
+                 const char* childName3, HandleValue child3,
+                 const char* childName4, HandleValue child4,
+                 const char* childName5, HandleValue child5,
+                 const char* childName6, HandleValue child6,
+                 const char* childName7, HandleValue child7,
                  MutableHandleValue dst) {
         RootedObject node(cx);
         return newNode(type, pos, &node) &&
@@ -417,7 +461,7 @@ class NodeBuilder
                setResult(node, dst);
     }
 
-    bool listNode(ASTType type, const char *propName, NodeVector &elts, TokenPos *pos,
+    bool listNode(ASTType type, const char* propName, NodeVector& elts, TokenPos* pos,
                   MutableHandleValue dst) {
         RootedValue array(cx);
         if (!newArray(elts, &array))
@@ -430,7 +474,7 @@ class NodeBuilder
         return newNode(type, pos, propName, array, dst);
     }
 
-    bool setProperty(HandleObject obj, const char *name, HandleValue val) {
+    bool setProperty(HandleObject obj, const char* name, HandleValue val) {
         JS_ASSERT_IF(val.isMagic(), val.whyMagic() == JS_SERIALIZE_NO_NODE);
 
         /*
@@ -445,9 +489,9 @@ class NodeBuilder
         return JSObject::defineProperty(cx, obj, atom->asPropertyName(), optVal);
     }
 
-    bool newNodeLoc(TokenPos *pos, MutableHandleValue dst);
+    bool newNodeLoc(TokenPos* pos, MutableHandleValue dst);
 
-    bool setNodeLoc(HandleObject node, TokenPos *pos);
+    bool setNodeLoc(HandleObject node, TokenPos* pos);
 
     bool setResult(HandleObject obj, MutableHandleValue dst) {
         JS_ASSERT(obj);
@@ -469,28 +513,26 @@ class NodeBuilder
      * misc nodes
      */
 
-    bool program(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool program(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool literal(HandleValue val, TokenPos *pos, MutableHandleValue dst);
+    bool literal(HandleValue val, TokenPos* pos, MutableHandleValue dst);
 
-    bool identifier(HandleValue name, TokenPos *pos, MutableHandleValue dst);
+    bool identifier(HandleValue name, TokenPos* pos, MutableHandleValue dst);
 
-    bool module(TokenPos *pos, HandleValue name, HandleValue body, MutableHandleValue dst);
-
-    bool function(ASTType type, TokenPos *pos,
-                  HandleValue id, NodeVector &args, NodeVector &defaults,
+    bool function(ASTType type, TokenPos* pos,
+                  HandleValue id, NodeVector& args, NodeVector& defaults,
                   HandleValue body, HandleValue rest, bool isGenerator, bool isExpression,
                   MutableHandleValue dst);
 
-    bool variableDeclarator(HandleValue id, HandleValue init, TokenPos *pos,
+    bool variableDeclarator(HandleValue id, HandleValue init, TokenPos* pos,
                             MutableHandleValue dst);
 
-    bool switchCase(HandleValue expr, NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool switchCase(HandleValue expr, NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool catchClause(HandleValue var, HandleValue guard, HandleValue body, TokenPos *pos,
+    bool catchClause(HandleValue var, HandleValue guard, HandleValue body, TokenPos* pos,
                      MutableHandleValue dst);
 
-    bool propertyInitializer(HandleValue key, HandleValue val, PropKind kind, TokenPos *pos,
+    bool propertyInitializer(HandleValue key, HandleValue val, PropKind kind, TokenPos* pos,
                              MutableHandleValue dst);
 
 
@@ -498,129 +540,141 @@ class NodeBuilder
      * statements
      */
 
-    bool blockStatement(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool blockStatement(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool expressionStatement(HandleValue expr, TokenPos *pos, MutableHandleValue dst);
+    bool expressionStatement(HandleValue expr, TokenPos* pos, MutableHandleValue dst);
 
-    bool emptyStatement(TokenPos *pos, MutableHandleValue dst);
+    bool emptyStatement(TokenPos* pos, MutableHandleValue dst);
 
-    bool ifStatement(HandleValue test, HandleValue cons, HandleValue alt, TokenPos *pos,
+    bool ifStatement(HandleValue test, HandleValue cons, HandleValue alt, TokenPos* pos,
                      MutableHandleValue dst);
 
-    bool breakStatement(HandleValue label, TokenPos *pos, MutableHandleValue dst);
+    bool breakStatement(HandleValue label, TokenPos* pos, MutableHandleValue dst);
 
-    bool continueStatement(HandleValue label, TokenPos *pos, MutableHandleValue dst);
+    bool continueStatement(HandleValue label, TokenPos* pos, MutableHandleValue dst);
 
-    bool labeledStatement(HandleValue label, HandleValue stmt, TokenPos *pos,
+    bool labeledStatement(HandleValue label, HandleValue stmt, TokenPos* pos,
                           MutableHandleValue dst);
 
-    bool throwStatement(HandleValue arg, TokenPos *pos, MutableHandleValue dst);
+    bool throwStatement(HandleValue arg, TokenPos* pos, MutableHandleValue dst);
 
-    bool returnStatement(HandleValue arg, TokenPos *pos, MutableHandleValue dst);
+    bool returnStatement(HandleValue arg, TokenPos* pos, MutableHandleValue dst);
 
     bool forStatement(HandleValue init, HandleValue test, HandleValue update, HandleValue stmt,
-                      TokenPos *pos, MutableHandleValue dst);
+                      TokenPos* pos, MutableHandleValue dst);
 
     bool forInStatement(HandleValue var, HandleValue expr, HandleValue stmt,
-                        bool isForEach, TokenPos *pos, MutableHandleValue dst);
+                        bool isForEach, TokenPos* pos, MutableHandleValue dst);
 
-    bool forOfStatement(HandleValue var, HandleValue expr, HandleValue stmt, TokenPos *pos,
+    bool forOfStatement(HandleValue var, HandleValue expr, HandleValue stmt, TokenPos* pos,
                         MutableHandleValue dst);
 
-    bool withStatement(HandleValue expr, HandleValue stmt, TokenPos *pos, MutableHandleValue dst);
+    bool withStatement(HandleValue expr, HandleValue stmt, TokenPos* pos, MutableHandleValue dst);
 
-    bool whileStatement(HandleValue test, HandleValue stmt, TokenPos *pos, MutableHandleValue dst);
+    bool whileStatement(HandleValue test, HandleValue stmt, TokenPos* pos, MutableHandleValue dst);
 
-    bool doWhileStatement(HandleValue stmt, HandleValue test, TokenPos *pos,
+    bool doWhileStatement(HandleValue stmt, HandleValue test, TokenPos* pos,
                           MutableHandleValue dst);
 
-    bool switchStatement(HandleValue disc, NodeVector &elts, bool lexical, TokenPos *pos,
+    bool switchStatement(HandleValue disc, NodeVector& elts, bool lexical, TokenPos* pos,
                          MutableHandleValue dst);
 
-    bool tryStatement(HandleValue body, NodeVector &guarded, HandleValue unguarded,
-                      HandleValue finally, TokenPos *pos, MutableHandleValue dst);
+    bool tryStatement(HandleValue body, NodeVector& guarded, HandleValue unguarded,
+                      HandleValue finally, TokenPos* pos, MutableHandleValue dst);
 
-    bool debuggerStatement(TokenPos *pos, MutableHandleValue dst);
+    bool debuggerStatement(TokenPos* pos, MutableHandleValue dst);
 
-    bool letStatement(NodeVector &head, HandleValue stmt, TokenPos *pos, MutableHandleValue dst);
+    bool letStatement(NodeVector& head, HandleValue stmt, TokenPos* pos, MutableHandleValue dst);
+
+    bool importDeclaration(NodeVector& elts, HandleValue moduleSpec, TokenPos* pos, MutableHandleValue dst);
+
+    bool importSpecifier(HandleValue importName, HandleValue bindingName, TokenPos* pos, MutableHandleValue dst);
+
+    bool exportDeclaration(HandleValue decl, NodeVector& elts, HandleValue moduleSpec, TokenPos* pos, MutableHandleValue dst);
+
+    bool exportSpecifier(HandleValue bindingName, HandleValue exportName, TokenPos* pos, MutableHandleValue dst);
+
+    bool exportBatchSpecifier(TokenPos* pos, MutableHandleValue dst);
 
     /*
      * expressions
      */
 
-    bool binaryExpression(BinaryOperator op, HandleValue left, HandleValue right, TokenPos *pos,
+    bool binaryExpression(BinaryOperator op, HandleValue left, HandleValue right, TokenPos* pos,
                           MutableHandleValue dst);
 
-    bool unaryExpression(UnaryOperator op, HandleValue expr, TokenPos *pos, MutableHandleValue dst);
+    bool unaryExpression(UnaryOperator op, HandleValue expr, TokenPos* pos, MutableHandleValue dst);
 
     bool assignmentExpression(AssignmentOperator op, HandleValue lhs, HandleValue rhs,
-                              TokenPos *pos, MutableHandleValue dst);
+                              TokenPos* pos, MutableHandleValue dst);
 
-    bool updateExpression(HandleValue expr, bool incr, bool prefix, TokenPos *pos,
+    bool updateExpression(HandleValue expr, bool incr, bool prefix, TokenPos* pos,
                           MutableHandleValue dst);
 
-    bool logicalExpression(bool lor, HandleValue left, HandleValue right, TokenPos *pos,
+    bool logicalExpression(bool lor, HandleValue left, HandleValue right, TokenPos* pos,
                            MutableHandleValue dst);
 
-    bool conditionalExpression(HandleValue test, HandleValue cons, HandleValue alt, TokenPos *pos,
+    bool conditionalExpression(HandleValue test, HandleValue cons, HandleValue alt, TokenPos* pos,
                                MutableHandleValue dst);
 
-    bool sequenceExpression(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool sequenceExpression(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool newExpression(HandleValue callee, NodeVector &args, TokenPos *pos, MutableHandleValue dst);
+    bool newExpression(HandleValue callee, NodeVector& args, TokenPos* pos, MutableHandleValue dst);
 
-    bool callExpression(HandleValue callee, NodeVector &args, TokenPos *pos,
+    bool callExpression(HandleValue callee, NodeVector& args, TokenPos* pos,
                         MutableHandleValue dst);
 
-    bool memberExpression(bool computed, HandleValue expr, HandleValue member, TokenPos *pos,
+    bool memberExpression(bool computed, HandleValue expr, HandleValue member, TokenPos* pos,
                           MutableHandleValue dst);
 
-    bool arrayExpression(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool arrayExpression(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool spreadExpression(HandleValue expr, TokenPos *pos, MutableHandleValue dst);
+    bool spreadExpression(HandleValue expr, TokenPos* pos, MutableHandleValue dst);
 
-    bool objectExpression(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool objectExpression(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool thisExpression(TokenPos *pos, MutableHandleValue dst);
+    bool thisExpression(TokenPos* pos, MutableHandleValue dst);
 
-    bool yieldExpression(HandleValue arg, TokenPos *pos, MutableHandleValue dst);
+    bool yieldExpression(HandleValue arg, YieldKind kind, TokenPos* pos, MutableHandleValue dst);
 
-    bool comprehensionBlock(HandleValue patt, HandleValue src, bool isForEach, bool isForOf, TokenPos *pos,
+    bool comprehensionBlock(HandleValue patt, HandleValue src, bool isForEach, bool isForOf, TokenPos* pos,
                             MutableHandleValue dst);
 
-    bool comprehensionExpression(HandleValue body, NodeVector &blocks, HandleValue filter,
-                                 TokenPos *pos, MutableHandleValue dst);
+    bool comprehensionExpression(HandleValue body, NodeVector& blocks, HandleValue filter,
+                                 TokenPos* pos, MutableHandleValue dst);
 
-    bool generatorExpression(HandleValue body, NodeVector &blocks, HandleValue filter,
-                             TokenPos *pos, MutableHandleValue dst);
+    bool generatorExpression(HandleValue body, NodeVector& blocks, HandleValue filter,
+                             TokenPos* pos, MutableHandleValue dst);
 
-    bool letExpression(NodeVector &head, HandleValue expr, TokenPos *pos, MutableHandleValue dst);
+    bool letExpression(NodeVector& head, HandleValue expr, TokenPos* pos, MutableHandleValue dst);
 
     /*
      * declarations
      */
 
-    bool variableDeclaration(NodeVector &elts, VarDeclKind kind, TokenPos *pos,
+    bool variableDeclaration(NodeVector& elts, VarDeclKind kind, TokenPos* pos,
                              MutableHandleValue dst);
 
     /*
      * patterns
      */
 
-    bool arrayPattern(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool arrayPattern(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool objectPattern(NodeVector &elts, TokenPos *pos, MutableHandleValue dst);
+    bool objectPattern(NodeVector& elts, TokenPos* pos, MutableHandleValue dst);
 
-    bool propertyPattern(HandleValue key, HandleValue patt, TokenPos *pos, MutableHandleValue dst);
+    bool propertyPattern(HandleValue key, HandleValue patt, TokenPos* pos, MutableHandleValue dst);
 };
 
+} /* anonymous namespace */
+
 bool
-NodeBuilder::newNode(ASTType type, TokenPos *pos, MutableHandleObject dst)
+NodeBuilder::newNode(ASTType type, TokenPos* pos, MutableHandleObject dst)
 {
     JS_ASSERT(type > AST_ERROR && type < AST_LIMIT);
 
     RootedValue tv(cx);
-    RootedObject node(cx, NewBuiltinClassInstance(cx, &ObjectClass));
+    RootedObject node(cx, NewBuiltinClassInstance(cx, &JSObject::class_));
     if (!node ||
         !setNodeLoc(node, pos) ||
         !atomValue(nodeTypeNames[type], &tv) ||
@@ -633,7 +687,7 @@ NodeBuilder::newNode(ASTType type, TokenPos *pos, MutableHandleObject dst)
 }
 
 bool
-NodeBuilder::newArray(NodeVector &elts, MutableHandleValue dst)
+NodeBuilder::newArray(NodeVector& elts, MutableHandleValue dst)
 {
     const size_t len = elts.length();
     if (len > UINT32_MAX) {
@@ -662,7 +716,7 @@ NodeBuilder::newArray(NodeVector &elts, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::newNodeLoc(TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::newNodeLoc(TokenPos* pos, MutableHandleValue dst)
 {
     if (!pos) {
         dst.setNull();
@@ -714,7 +768,7 @@ NodeBuilder::newNodeLoc(TokenPos *pos, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::setNodeLoc(HandleObject node, TokenPos *pos)
+NodeBuilder::setNodeLoc(HandleObject node, TokenPos* pos)
 {
     if (!saveLoc) {
         RootedValue nullVal(cx, NullValue());
@@ -728,19 +782,19 @@ NodeBuilder::setNodeLoc(HandleObject node, TokenPos *pos)
 }
 
 bool
-NodeBuilder::program(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::program(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_PROGRAM, "body", elts, pos, dst);
 }
 
 bool
-NodeBuilder::blockStatement(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::blockStatement(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_BLOCK_STMT, "body", elts, pos, dst);
 }
 
 bool
-NodeBuilder::expressionStatement(HandleValue expr, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::expressionStatement(HandleValue expr, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_EXPR_STMT]);
     if (!cb.isNull())
@@ -750,7 +804,7 @@ NodeBuilder::expressionStatement(HandleValue expr, TokenPos *pos, MutableHandleV
 }
 
 bool
-NodeBuilder::emptyStatement(TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::emptyStatement(TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_EMPTY_STMT]);
     if (!cb.isNull())
@@ -760,7 +814,7 @@ NodeBuilder::emptyStatement(TokenPos *pos, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::ifStatement(HandleValue test, HandleValue cons, HandleValue alt, TokenPos *pos,
+NodeBuilder::ifStatement(HandleValue test, HandleValue cons, HandleValue alt, TokenPos* pos,
                          MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_IF_STMT]);
@@ -775,7 +829,7 @@ NodeBuilder::ifStatement(HandleValue test, HandleValue cons, HandleValue alt, To
 }
 
 bool
-NodeBuilder::breakStatement(HandleValue label, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::breakStatement(HandleValue label, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_BREAK_STMT]);
     if (!cb.isNull())
@@ -785,7 +839,7 @@ NodeBuilder::breakStatement(HandleValue label, TokenPos *pos, MutableHandleValue
 }
 
 bool
-NodeBuilder::continueStatement(HandleValue label, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::continueStatement(HandleValue label, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_CONTINUE_STMT]);
     if (!cb.isNull())
@@ -795,7 +849,7 @@ NodeBuilder::continueStatement(HandleValue label, TokenPos *pos, MutableHandleVa
 }
 
 bool
-NodeBuilder::labeledStatement(HandleValue label, HandleValue stmt, TokenPos *pos,
+NodeBuilder::labeledStatement(HandleValue label, HandleValue stmt, TokenPos* pos,
                               MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_LAB_STMT]);
@@ -809,7 +863,7 @@ NodeBuilder::labeledStatement(HandleValue label, HandleValue stmt, TokenPos *pos
 }
 
 bool
-NodeBuilder::throwStatement(HandleValue arg, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::throwStatement(HandleValue arg, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_THROW_STMT]);
     if (!cb.isNull())
@@ -819,7 +873,7 @@ NodeBuilder::throwStatement(HandleValue arg, TokenPos *pos, MutableHandleValue d
 }
 
 bool
-NodeBuilder::returnStatement(HandleValue arg, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::returnStatement(HandleValue arg, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_RETURN_STMT]);
     if (!cb.isNull())
@@ -830,7 +884,7 @@ NodeBuilder::returnStatement(HandleValue arg, TokenPos *pos, MutableHandleValue 
 
 bool
 NodeBuilder::forStatement(HandleValue init, HandleValue test, HandleValue update, HandleValue stmt,
-                          TokenPos *pos, MutableHandleValue dst)
+                          TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_FOR_STMT]);
     if (!cb.isNull())
@@ -846,7 +900,7 @@ NodeBuilder::forStatement(HandleValue init, HandleValue test, HandleValue update
 
 bool
 NodeBuilder::forInStatement(HandleValue var, HandleValue expr, HandleValue stmt, bool isForEach,
-                            TokenPos *pos, MutableHandleValue dst)
+                            TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue isForEachVal(cx, BooleanValue(isForEach));
 
@@ -863,7 +917,7 @@ NodeBuilder::forInStatement(HandleValue var, HandleValue expr, HandleValue stmt,
 }
 
 bool
-NodeBuilder::forOfStatement(HandleValue var, HandleValue expr, HandleValue stmt, TokenPos *pos,
+NodeBuilder::forOfStatement(HandleValue var, HandleValue expr, HandleValue stmt, TokenPos* pos,
                             MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_FOR_OF_STMT]);
@@ -878,7 +932,7 @@ NodeBuilder::forOfStatement(HandleValue var, HandleValue expr, HandleValue stmt,
 }
 
 bool
-NodeBuilder::withStatement(HandleValue expr, HandleValue stmt, TokenPos *pos,
+NodeBuilder::withStatement(HandleValue expr, HandleValue stmt, TokenPos* pos,
                            MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_WITH_STMT]);
@@ -892,7 +946,7 @@ NodeBuilder::withStatement(HandleValue expr, HandleValue stmt, TokenPos *pos,
 }
 
 bool
-NodeBuilder::whileStatement(HandleValue test, HandleValue stmt, TokenPos *pos,
+NodeBuilder::whileStatement(HandleValue test, HandleValue stmt, TokenPos* pos,
                             MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_WHILE_STMT]);
@@ -906,7 +960,7 @@ NodeBuilder::whileStatement(HandleValue test, HandleValue stmt, TokenPos *pos,
 }
 
 bool
-NodeBuilder::doWhileStatement(HandleValue stmt, HandleValue test, TokenPos *pos,
+NodeBuilder::doWhileStatement(HandleValue stmt, HandleValue test, TokenPos* pos,
                               MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_DO_STMT]);
@@ -920,7 +974,7 @@ NodeBuilder::doWhileStatement(HandleValue stmt, HandleValue test, TokenPos *pos,
 }
 
 bool
-NodeBuilder::switchStatement(HandleValue disc, NodeVector &elts, bool lexical, TokenPos *pos,
+NodeBuilder::switchStatement(HandleValue disc, NodeVector& elts, bool lexical, TokenPos* pos,
                              MutableHandleValue dst)
 {
     RootedValue array(cx);
@@ -941,8 +995,8 @@ NodeBuilder::switchStatement(HandleValue disc, NodeVector &elts, bool lexical, T
 }
 
 bool
-NodeBuilder::tryStatement(HandleValue body, NodeVector &guarded, HandleValue unguarded,
-                          HandleValue finally, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::tryStatement(HandleValue body, NodeVector& guarded, HandleValue unguarded,
+                          HandleValue finally, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue guardedHandlers(cx);
     if (!newArray(guarded, &guardedHandlers))
@@ -961,7 +1015,7 @@ NodeBuilder::tryStatement(HandleValue body, NodeVector &guarded, HandleValue ung
 }
 
 bool
-NodeBuilder::debuggerStatement(TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::debuggerStatement(TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_DEBUGGER_STMT]);
     if (!cb.isNull())
@@ -971,7 +1025,7 @@ NodeBuilder::debuggerStatement(TokenPos *pos, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::binaryExpression(BinaryOperator op, HandleValue left, HandleValue right, TokenPos *pos,
+NodeBuilder::binaryExpression(BinaryOperator op, HandleValue left, HandleValue right, TokenPos* pos,
                               MutableHandleValue dst)
 {
     JS_ASSERT(op > BINOP_ERR && op < BINOP_LIMIT);
@@ -992,7 +1046,7 @@ NodeBuilder::binaryExpression(BinaryOperator op, HandleValue left, HandleValue r
 }
 
 bool
-NodeBuilder::unaryExpression(UnaryOperator unop, HandleValue expr, TokenPos *pos,
+NodeBuilder::unaryExpression(UnaryOperator unop, HandleValue expr, TokenPos* pos,
                              MutableHandleValue dst)
 {
     JS_ASSERT(unop > UNOP_ERR && unop < UNOP_LIMIT);
@@ -1015,7 +1069,7 @@ NodeBuilder::unaryExpression(UnaryOperator unop, HandleValue expr, TokenPos *pos
 
 bool
 NodeBuilder::assignmentExpression(AssignmentOperator aop, HandleValue lhs, HandleValue rhs,
-                                  TokenPos *pos, MutableHandleValue dst)
+                                  TokenPos* pos, MutableHandleValue dst)
 {
     JS_ASSERT(aop > AOP_ERR && aop < AOP_LIMIT);
 
@@ -1035,7 +1089,7 @@ NodeBuilder::assignmentExpression(AssignmentOperator aop, HandleValue lhs, Handl
 }
 
 bool
-NodeBuilder::updateExpression(HandleValue expr, bool incr, bool prefix, TokenPos *pos,
+NodeBuilder::updateExpression(HandleValue expr, bool incr, bool prefix, TokenPos* pos,
                               MutableHandleValue dst)
 {
     RootedValue opName(cx);
@@ -1056,7 +1110,7 @@ NodeBuilder::updateExpression(HandleValue expr, bool incr, bool prefix, TokenPos
 }
 
 bool
-NodeBuilder::logicalExpression(bool lor, HandleValue left, HandleValue right, TokenPos *pos,
+NodeBuilder::logicalExpression(bool lor, HandleValue left, HandleValue right, TokenPos* pos,
                                MutableHandleValue dst)
 {
     RootedValue opName(cx);
@@ -1076,7 +1130,7 @@ NodeBuilder::logicalExpression(bool lor, HandleValue left, HandleValue right, To
 
 bool
 NodeBuilder::conditionalExpression(HandleValue test, HandleValue cons, HandleValue alt,
-                                   TokenPos *pos, MutableHandleValue dst)
+                                   TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_COND_EXPR]);
     if (!cb.isNull())
@@ -1090,13 +1144,13 @@ NodeBuilder::conditionalExpression(HandleValue test, HandleValue cons, HandleVal
 }
 
 bool
-NodeBuilder::sequenceExpression(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::sequenceExpression(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_LIST_EXPR, "expressions", elts, pos, dst);
 }
 
 bool
-NodeBuilder::callExpression(HandleValue callee, NodeVector &args, TokenPos *pos,
+NodeBuilder::callExpression(HandleValue callee, NodeVector& args, TokenPos* pos,
                             MutableHandleValue dst)
 {
     RootedValue array(cx);
@@ -1114,7 +1168,7 @@ NodeBuilder::callExpression(HandleValue callee, NodeVector &args, TokenPos *pos,
 }
 
 bool
-NodeBuilder::newExpression(HandleValue callee, NodeVector &args, TokenPos *pos,
+NodeBuilder::newExpression(HandleValue callee, NodeVector& args, TokenPos* pos,
                            MutableHandleValue dst)
 {
     RootedValue array(cx);
@@ -1132,7 +1186,7 @@ NodeBuilder::newExpression(HandleValue callee, NodeVector &args, TokenPos *pos,
 }
 
 bool
-NodeBuilder::memberExpression(bool computed, HandleValue expr, HandleValue member, TokenPos *pos,
+NodeBuilder::memberExpression(bool computed, HandleValue expr, HandleValue member, TokenPos* pos,
                               MutableHandleValue dst)
 {
     RootedValue computedVal(cx, BooleanValue(computed));
@@ -1149,13 +1203,13 @@ NodeBuilder::memberExpression(bool computed, HandleValue expr, HandleValue membe
 }
 
 bool
-NodeBuilder::arrayExpression(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::arrayExpression(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_ARRAY_EXPR, "elements", elts, pos, dst);
 }
 
 bool
-NodeBuilder::spreadExpression(HandleValue expr, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::spreadExpression(HandleValue expr, TokenPos* pos, MutableHandleValue dst)
 {
     return newNode(AST_SPREAD_EXPR, pos,
                    "expression", expr,
@@ -1163,7 +1217,7 @@ NodeBuilder::spreadExpression(HandleValue expr, TokenPos *pos, MutableHandleValu
 }
 
 bool
-NodeBuilder::propertyPattern(HandleValue key, HandleValue patt, TokenPos *pos,
+NodeBuilder::propertyPattern(HandleValue key, HandleValue patt, TokenPos* pos,
                              MutableHandleValue dst)
 {
     RootedValue kindName(cx);
@@ -1182,7 +1236,7 @@ NodeBuilder::propertyPattern(HandleValue key, HandleValue patt, TokenPos *pos,
 }
 
 bool
-NodeBuilder::propertyInitializer(HandleValue key, HandleValue val, PropKind kind, TokenPos *pos,
+NodeBuilder::propertyInitializer(HandleValue key, HandleValue val, PropKind kind, TokenPos* pos,
                                  MutableHandleValue dst)
 {
     RootedValue kindName(cx);
@@ -1206,13 +1260,13 @@ NodeBuilder::propertyInitializer(HandleValue key, HandleValue val, PropKind kind
 }
 
 bool
-NodeBuilder::objectExpression(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::objectExpression(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_OBJECT_EXPR, "properties", elts, pos, dst);
 }
 
 bool
-NodeBuilder::thisExpression(TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::thisExpression(TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_THIS_EXPR]);
     if (!cb.isNull())
@@ -1222,17 +1276,27 @@ NodeBuilder::thisExpression(TokenPos *pos, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::yieldExpression(HandleValue arg, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::yieldExpression(HandleValue arg, YieldKind kind, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_YIELD_EXPR]);
-    if (!cb.isNull())
-        return callback(cb, opt(arg), pos, dst);
+    RootedValue delegateVal(cx);
 
-    return newNode(AST_YIELD_EXPR, pos, "argument", arg, dst);
+    switch (kind) {
+      case Delegating:
+        delegateVal = BooleanValue(true);
+        break;
+      case NotDelegating:
+        delegateVal = BooleanValue(false);
+        break;
+    }
+
+    if (!cb.isNull())
+        return callback(cb, opt(arg), delegateVal, pos, dst);
+    return newNode(AST_YIELD_EXPR, pos, "argument", arg, "delegate", delegateVal, dst);
 }
 
 bool
-NodeBuilder::comprehensionBlock(HandleValue patt, HandleValue src, bool isForEach, bool isForOf, TokenPos *pos,
+NodeBuilder::comprehensionBlock(HandleValue patt, HandleValue src, bool isForEach, bool isForOf, TokenPos* pos,
                                 MutableHandleValue dst)
 {
     RootedValue isForEachVal(cx, BooleanValue(isForEach));
@@ -1251,8 +1315,8 @@ NodeBuilder::comprehensionBlock(HandleValue patt, HandleValue src, bool isForEac
 }
 
 bool
-NodeBuilder::comprehensionExpression(HandleValue body, NodeVector &blocks, HandleValue filter,
-                                     TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::comprehensionExpression(HandleValue body, NodeVector& blocks, HandleValue filter,
+                                     TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue array(cx);
     if (!newArray(blocks, &array))
@@ -1270,8 +1334,8 @@ NodeBuilder::comprehensionExpression(HandleValue body, NodeVector &blocks, Handl
 }
 
 bool
-NodeBuilder::generatorExpression(HandleValue body, NodeVector &blocks, HandleValue filter,
-                                 TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::generatorExpression(HandleValue body, NodeVector& blocks, HandleValue filter,
+                                 TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue array(cx);
     if (!newArray(blocks, &array))
@@ -1289,7 +1353,7 @@ NodeBuilder::generatorExpression(HandleValue body, NodeVector &blocks, HandleVal
 }
 
 bool
-NodeBuilder::letExpression(NodeVector &head, HandleValue expr, TokenPos *pos,
+NodeBuilder::letExpression(NodeVector& head, HandleValue expr, TokenPos* pos,
                            MutableHandleValue dst)
 {
     RootedValue array(cx);
@@ -1307,7 +1371,7 @@ NodeBuilder::letExpression(NodeVector &head, HandleValue expr, TokenPos *pos,
 }
 
 bool
-NodeBuilder::letStatement(NodeVector &head, HandleValue stmt, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::letStatement(NodeVector& head, HandleValue stmt, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue array(cx);
     if (!newArray(head, &array))
@@ -1324,7 +1388,83 @@ NodeBuilder::letStatement(NodeVector &head, HandleValue stmt, TokenPos *pos, Mut
 }
 
 bool
-NodeBuilder::variableDeclaration(NodeVector &elts, VarDeclKind kind, TokenPos *pos,
+NodeBuilder::importDeclaration(NodeVector& elts, HandleValue moduleSpec, TokenPos* pos,
+                               MutableHandleValue dst)
+{
+    RootedValue array(cx);
+    if (!newArray(elts, &array))
+        return false;
+
+    RootedValue cb(cx, callbacks[AST_IMPORT_DECL]);
+    if (!cb.isNull())
+        return callback(cb, array, moduleSpec, pos, dst);
+
+    return newNode(AST_IMPORT_DECL, pos,
+                   "specifiers", array,
+                   "source", moduleSpec,
+                   dst);
+}
+
+bool
+NodeBuilder::importSpecifier(HandleValue importName, HandleValue bindingName, TokenPos* pos,
+                             MutableHandleValue dst)
+{
+    RootedValue cb(cx, callbacks[AST_IMPORT_SPEC]);
+    if (!cb.isNull())
+        return callback(cb, importName, bindingName, pos, dst);
+
+    return newNode(AST_IMPORT_SPEC, pos,
+                   "id", importName,
+                   "name", bindingName,
+                   dst);
+}
+
+bool
+NodeBuilder::exportDeclaration(HandleValue decl, NodeVector& elts, HandleValue moduleSpec,
+                               TokenPos* pos, MutableHandleValue dst)
+{
+    RootedValue array(cx, NullValue());
+    if (decl.isNull() && !newArray(elts, &array))
+        return false;
+
+    RootedValue cb(cx, callbacks[AST_IMPORT_DECL]);
+
+    if (!cb.isNull())
+        return callback(cb, decl, array, moduleSpec, pos, dst);
+
+    return newNode(AST_EXPORT_DECL, pos,
+                   "declaration", decl,
+                   "specifiers", array,
+                   "source", moduleSpec,
+                   dst);
+}
+
+bool
+NodeBuilder::exportSpecifier(HandleValue bindingName, HandleValue exportName, TokenPos* pos,
+                             MutableHandleValue dst)
+{
+    RootedValue cb(cx, callbacks[AST_EXPORT_SPEC]);
+    if (!cb.isNull())
+        return callback(cb, bindingName, exportName, pos, dst);
+
+    return newNode(AST_EXPORT_SPEC, pos,
+                   "id", bindingName,
+                   "name", exportName,
+                   dst);
+}
+
+bool
+NodeBuilder::exportBatchSpecifier(TokenPos* pos, MutableHandleValue dst)
+{
+    RootedValue cb(cx, callbacks[AST_EXPORT_BATCH_SPEC]);
+    if (!cb.isNull())
+        return callback(cb, pos, dst);
+
+    return newNode(AST_EXPORT_BATCH_SPEC, pos, dst);
+}
+
+bool
+NodeBuilder::variableDeclaration(NodeVector& elts, VarDeclKind kind, TokenPos* pos,
                                  MutableHandleValue dst)
 {
     JS_ASSERT(kind > VARDECL_ERR && kind < VARDECL_LIMIT);
@@ -1350,7 +1490,7 @@ NodeBuilder::variableDeclaration(NodeVector &elts, VarDeclKind kind, TokenPos *p
 }
 
 bool
-NodeBuilder::variableDeclarator(HandleValue id, HandleValue init, TokenPos *pos,
+NodeBuilder::variableDeclarator(HandleValue id, HandleValue init, TokenPos* pos,
                                 MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_VAR_DTOR]);
@@ -1361,7 +1501,7 @@ NodeBuilder::variableDeclarator(HandleValue id, HandleValue init, TokenPos *pos,
 }
 
 bool
-NodeBuilder::switchCase(HandleValue expr, NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::switchCase(HandleValue expr, NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue array(cx);
     if (!newArray(elts, &array))
@@ -1378,7 +1518,7 @@ NodeBuilder::switchCase(HandleValue expr, NodeVector &elts, TokenPos *pos, Mutab
 }
 
 bool
-NodeBuilder::catchClause(HandleValue var, HandleValue guard, HandleValue body, TokenPos *pos,
+NodeBuilder::catchClause(HandleValue var, HandleValue guard, HandleValue body, TokenPos* pos,
                          MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_CATCH]);
@@ -1393,7 +1533,7 @@ NodeBuilder::catchClause(HandleValue var, HandleValue guard, HandleValue body, T
 }
 
 bool
-NodeBuilder::literal(HandleValue val, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::literal(HandleValue val, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_LITERAL]);
     if (!cb.isNull())
@@ -1403,7 +1543,7 @@ NodeBuilder::literal(HandleValue val, TokenPos *pos, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::identifier(HandleValue name, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::identifier(HandleValue name, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue cb(cx, callbacks[AST_IDENTIFIER]);
     if (!cb.isNull())
@@ -1413,34 +1553,20 @@ NodeBuilder::identifier(HandleValue name, TokenPos *pos, MutableHandleValue dst)
 }
 
 bool
-NodeBuilder::objectPattern(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::objectPattern(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_OBJECT_PATT, "properties", elts, pos, dst);
 }
 
 bool
-NodeBuilder::arrayPattern(NodeVector &elts, TokenPos *pos, MutableHandleValue dst)
+NodeBuilder::arrayPattern(NodeVector& elts, TokenPos* pos, MutableHandleValue dst)
 {
     return listNode(AST_ARRAY_PATT, "elements", elts, pos, dst);
 }
 
 bool
-NodeBuilder::module(TokenPos *pos, HandleValue name, HandleValue body, MutableHandleValue dst)
-{
-    RootedValue cb(cx, callbacks[AST_MODULE_DECL]);
-    if (!cb.isNull()) {
-        return callback(cb, name, body, pos, dst);
-    }
-
-    return newNode(AST_MODULE_DECL, pos,
-                   "name", name,
-                   "body", body,
-                   dst);
-}
-
-bool
-NodeBuilder::function(ASTType type, TokenPos *pos,
-                      HandleValue id, NodeVector &args, NodeVector &defaults,
+NodeBuilder::function(ASTType type, TokenPos* pos,
+                      HandleValue id, NodeVector& args, NodeVector& defaults,
                       HandleValue body, HandleValue rest,
                       bool isGenerator, bool isExpression,
                       MutableHandleValue dst)
@@ -1470,6 +1596,8 @@ NodeBuilder::function(ASTType type, TokenPos *pos,
                    dst);
 }
 
+namespace {
+
 /*
  * Serialization of parse nodes to JavaScript objects.
  *
@@ -1477,12 +1605,12 @@ NodeBuilder::function(ASTType type, TokenPos *pos,
  */
 class ASTSerializer
 {
-    JSContext           *cx;
-    Parser<FullParseHandler> *parser;
+    JSContext*          cx;
+    Parser<FullParseHandler>* parser;
     NodeBuilder         builder;
     DebugOnly<uint32_t> lineno;
 
-    Value unrootedAtomContents(JSAtom *atom) {
+    Value unrootedAtomContents(JSAtom* atom) {
         return StringValue(atom ? atom : cx->names().empty);
     }
 
@@ -1490,20 +1618,24 @@ class ASTSerializer
     UnaryOperator unop(ParseNodeKind kind, JSOp op);
     AssignmentOperator aop(JSOp op);
 
-    bool statements(ParseNode *pn, NodeVector &elts);
-    bool expressions(ParseNode *pn, NodeVector &elts);
-    bool leftAssociate(ParseNode *pn, MutableHandleValue dst);
-    bool functionArgs(ParseNode *pn, ParseNode *pnargs, ParseNode *pndestruct, ParseNode *pnbody,
-                      NodeVector &args, NodeVector &defaults, MutableHandleValue rest);
+    bool statements(ParseNode* pn, NodeVector& elts);
+    bool expressions(ParseNode* pn, NodeVector& elts);
+    bool leftAssociate(ParseNode* pn, MutableHandleValue dst);
+    bool functionArgs(ParseNode* pn, ParseNode* pnargs, ParseNode* pndestruct, ParseNode* pnbody,
+                      NodeVector& args, NodeVector& defaults, MutableHandleValue rest);
 
-    bool sourceElement(ParseNode *pn, MutableHandleValue dst);
+    bool sourceElement(ParseNode* pn, MutableHandleValue dst);
 
-    bool declaration(ParseNode *pn, MutableHandleValue dst);
-    bool variableDeclaration(ParseNode *pn, bool let, MutableHandleValue dst);
-    bool variableDeclarator(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst);
-    bool let(ParseNode *pn, bool expr, MutableHandleValue dst);
+    bool declaration(ParseNode* pn, MutableHandleValue dst);
+    bool variableDeclaration(ParseNode* pn, bool let, MutableHandleValue dst);
+    bool variableDeclarator(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst);
+    bool let(ParseNode* pn, bool expr, MutableHandleValue dst);
+    bool importDeclaration(ParseNode* pn, MutableHandleValue dst);
+    bool importSpecifier(ParseNode* pn, MutableHandleValue dst);
+    bool exportDeclaration(ParseNode* pn, MutableHandleValue dst);
+    bool exportSpecifier(ParseNode* pn, MutableHandleValue dst);
 
-    bool optStatement(ParseNode *pn, MutableHandleValue dst) {
+    bool optStatement(ParseNode* pn, MutableHandleValue dst) {
         if (!pn) {
             dst.setMagic(JS_SERIALIZE_NO_NODE);
             return true;
@@ -1511,17 +1643,19 @@ class ASTSerializer
         return statement(pn, dst);
     }
 
-    bool forInit(ParseNode *pn, MutableHandleValue dst);
-    bool forOfOrIn(ParseNode *loop, ParseNode *head, HandleValue var, HandleValue stmt,
-                   MutableHandleValue dst);
-    bool statement(ParseNode *pn, MutableHandleValue dst);
-    bool blockStatement(ParseNode *pn, MutableHandleValue dst);
-    bool switchStatement(ParseNode *pn, MutableHandleValue dst);
-    bool switchCase(ParseNode *pn, MutableHandleValue dst);
-    bool tryStatement(ParseNode *pn, MutableHandleValue dst);
-    bool catchClause(ParseNode *pn, bool *isGuarded, MutableHandleValue dst);
+    bool forInit(ParseNode* pn, MutableHandleValue dst);
+    bool forIn(ParseNode* loop, ParseNode* head, HandleValue var, HandleValue stmt,
+               MutableHandleValue dst);
+    bool forOf(ParseNode* loop, ParseNode* head, HandleValue var, HandleValue stmt,
+               MutableHandleValue dst);
+    bool statement(ParseNode* pn, MutableHandleValue dst);
+    bool blockStatement(ParseNode* pn, MutableHandleValue dst);
+    bool switchStatement(ParseNode* pn, MutableHandleValue dst);
+    bool switchCase(ParseNode* pn, MutableHandleValue dst);
+    bool tryStatement(ParseNode* pn, MutableHandleValue dst);
+    bool catchClause(ParseNode* pn, bool* isGuarded, MutableHandleValue dst);
 
-    bool optExpression(ParseNode *pn, MutableHandleValue dst) {
+    bool optExpression(ParseNode* pn, MutableHandleValue dst) {
         if (!pn) {
             dst.setMagic(JS_SERIALIZE_NO_NODE);
             return true;
@@ -1529,12 +1663,12 @@ class ASTSerializer
         return expression(pn, dst);
     }
 
-    bool expression(ParseNode *pn, MutableHandleValue dst);
+    bool expression(ParseNode* pn, MutableHandleValue dst);
 
-    bool propertyName(ParseNode *pn, MutableHandleValue dst);
-    bool property(ParseNode *pn, MutableHandleValue dst);
+    bool propertyName(ParseNode* pn, MutableHandleValue dst);
+    bool property(ParseNode* pn, MutableHandleValue dst);
 
-    bool optIdentifier(HandleAtom atom, TokenPos *pos, MutableHandleValue dst) {
+    bool optIdentifier(HandleAtom atom, TokenPos* pos, MutableHandleValue dst) {
         if (!atom) {
             dst.setMagic(JS_SERIALIZE_NO_NODE);
             return true;
@@ -1542,26 +1676,25 @@ class ASTSerializer
         return identifier(atom, pos, dst);
     }
 
-    bool identifier(HandleAtom atom, TokenPos *pos, MutableHandleValue dst);
-    bool identifier(ParseNode *pn, MutableHandleValue dst);
-    bool literal(ParseNode *pn, MutableHandleValue dst);
+    bool identifier(HandleAtom atom, TokenPos* pos, MutableHandleValue dst);
+    bool identifier(ParseNode* pn, MutableHandleValue dst);
+    bool literal(ParseNode* pn, MutableHandleValue dst);
 
-    bool pattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst);
-    bool arrayPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst);
-    bool objectPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst);
+    bool pattern(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst);
+    bool arrayPattern(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst);
+    bool objectPattern(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst);
 
-    bool module(ParseNode *pn, MutableHandleValue dst);
-    bool function(ParseNode *pn, ASTType type, MutableHandleValue dst);
-    bool functionArgsAndBody(ParseNode *pn, NodeVector &args, NodeVector &defaults,
+    bool function(ParseNode* pn, ASTType type, MutableHandleValue dst);
+    bool functionArgsAndBody(ParseNode* pn, NodeVector& args, NodeVector& defaults,
                              MutableHandleValue body, MutableHandleValue rest);
-    bool moduleOrFunctionBody(ParseNode *pn, TokenPos *pos, MutableHandleValue dst);
+    bool functionBody(ParseNode* pn, TokenPos* pos, MutableHandleValue dst);
 
-    bool comprehensionBlock(ParseNode *pn, MutableHandleValue dst);
-    bool comprehension(ParseNode *pn, MutableHandleValue dst);
-    bool generatorExpression(ParseNode *pn, MutableHandleValue dst);
+    bool comprehensionBlock(ParseNode* pn, MutableHandleValue dst);
+    bool comprehension(ParseNode* pn, MutableHandleValue dst);
+    bool generatorExpression(ParseNode* pn, MutableHandleValue dst);
 
   public:
-    ASTSerializer(JSContext *c, bool l, char const *src, uint32_t ln)
+    ASTSerializer(JSContext* c, bool l, char const* src, uint32_t ln)
         : cx(c)
         , builder(c, l, src)
 #ifdef DEBUG
@@ -1573,13 +1706,15 @@ class ASTSerializer
         return builder.init(userobj);
     }
 
-    void setParser(Parser<FullParseHandler> *p) {
+    void setParser(Parser<FullParseHandler>* p) {
         parser = p;
         builder.setTokenStream(&p->tokenStream);
     }
 
-    bool program(ParseNode *pn, MutableHandleValue dst);
+    bool program(ParseNode* pn, MutableHandleValue dst);
 };
+
+} /* anonymous namespace */
 
 AssignmentOperator
 ASTSerializer::aop(JSOp op)
@@ -1691,7 +1826,7 @@ ASTSerializer::binop(ParseNodeKind kind, JSOp op)
 }
 
 bool
-ASTSerializer::statements(ParseNode *pn, NodeVector &elts)
+ASTSerializer::statements(ParseNode* pn, NodeVector& elts)
 {
     JS_ASSERT(pn->isKind(PNK_STATEMENTLIST));
     JS_ASSERT(pn->isArity(PN_LIST));
@@ -1699,7 +1834,7 @@ ASTSerializer::statements(ParseNode *pn, NodeVector &elts)
     if (!elts.reserve(pn->pn_count))
         return false;
 
-    for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
         JS_ASSERT(pn->pn_pos.encloses(next->pn_pos));
 
         RootedValue elt(cx);
@@ -1712,12 +1847,12 @@ ASTSerializer::statements(ParseNode *pn, NodeVector &elts)
 }
 
 bool
-ASTSerializer::expressions(ParseNode *pn, NodeVector &elts)
+ASTSerializer::expressions(ParseNode* pn, NodeVector& elts)
 {
     if (!elts.reserve(pn->pn_count))
         return false;
 
-    for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
         JS_ASSERT(pn->pn_pos.encloses(next->pn_pos));
 
         RootedValue elt(cx);
@@ -1730,7 +1865,7 @@ ASTSerializer::expressions(ParseNode *pn, NodeVector &elts)
 }
 
 bool
-ASTSerializer::blockStatement(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::blockStatement(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT(pn->isKind(PNK_STATEMENTLIST));
 
@@ -1740,7 +1875,7 @@ ASTSerializer::blockStatement(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::program(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::program(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT(parser->tokenStream.srcCoords.lineNum(pn->pn_pos.begin) == lineno);
 
@@ -1750,14 +1885,14 @@ ASTSerializer::program(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::sourceElement(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::sourceElement(ParseNode* pn, MutableHandleValue dst)
 {
     /* SpiderMonkey allows declarations even in pure statement contexts. */
     return statement(pn, dst);
 }
 
 bool
-ASTSerializer::declaration(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::declaration(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT(pn->isKind(PNK_FUNCTION) ||
               pn->isKind(PNK_VAR) ||
@@ -1779,7 +1914,7 @@ ASTSerializer::declaration(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::variableDeclaration(ParseNode *pn, bool let, MutableHandleValue dst)
+ASTSerializer::variableDeclaration(ParseNode* pn, bool let, MutableHandleValue dst)
 {
     JS_ASSERT(let ? pn->isKind(PNK_LET) : (pn->isKind(PNK_VAR) || pn->isKind(PNK_CONST)));
 
@@ -1789,7 +1924,7 @@ ASTSerializer::variableDeclaration(ParseNode *pn, bool let, MutableHandleValue d
     NodeVector dtors(cx);
     if (!dtors.reserve(pn->pn_count))
         return false;
-    for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
         RootedValue child(cx);
         if (!variableDeclarator(next, &kind, &child))
             return false;
@@ -1799,14 +1934,14 @@ ASTSerializer::variableDeclaration(ParseNode *pn, bool let, MutableHandleValue d
 }
 
 bool
-ASTSerializer::variableDeclarator(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst)
+ASTSerializer::variableDeclarator(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst)
 {
-    ParseNode *pnleft;
-    ParseNode *pnright;
+    ParseNode* pnleft;
+    ParseNode* pnright;
 
     if (pn->isKind(PNK_NAME)) {
         pnleft = pn;
-        pnright = pn->isUsed() ? NULL : pn->pn_expr;
+        pnright = pn->isUsed() ? nullptr : pn->pn_expr;
         JS_ASSERT_IF(pnright, pn->pn_pos.encloses(pnright->pn_pos));
     } else if (pn->isKind(PNK_ASSIGN)) {
         pnleft = pn->pn_left;
@@ -1816,7 +1951,7 @@ ASTSerializer::variableDeclarator(ParseNode *pn, VarDeclKind *pkind, MutableHand
     } else {
         /* This happens for a destructuring declarator in a for-in/of loop. */
         pnleft = pn;
-        pnright = NULL;
+        pnright = nullptr;
     }
 
     RootedValue left(cx), right(cx);
@@ -1826,15 +1961,15 @@ ASTSerializer::variableDeclarator(ParseNode *pn, VarDeclKind *pkind, MutableHand
 }
 
 bool
-ASTSerializer::let(ParseNode *pn, bool expr, MutableHandleValue dst)
+ASTSerializer::let(ParseNode* pn, bool expr, MutableHandleValue dst)
 {
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_left->pn_pos));
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_right->pn_pos));
 
-    ParseNode *letHead = pn->pn_left;
+    ParseNode* letHead = pn->pn_left;
     LOCAL_ASSERT(letHead->isArity(PN_LIST));
 
-    ParseNode *letBody = pn->pn_right;
+    ParseNode* letBody = pn->pn_right;
     LOCAL_ASSERT(letBody->isKind(PNK_LEXICALSCOPE));
 
     NodeVector dtors(cx);
@@ -1843,7 +1978,7 @@ ASTSerializer::let(ParseNode *pn, bool expr, MutableHandleValue dst)
 
     VarDeclKind kind = VARDECL_LET_HEAD;
 
-    for (ParseNode *next = letHead->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = letHead->pn_head; next; next = next->pn_next) {
         RootedValue child(cx);
         /*
          * Unlike in |variableDeclaration|, this does not update |kind|; since let-heads do
@@ -1863,7 +1998,105 @@ ASTSerializer::let(ParseNode *pn, bool expr, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::switchCase(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::importDeclaration(ParseNode* pn, MutableHandleValue dst)
+{
+    JS_ASSERT(pn->isKind(PNK_IMPORT));
+    JS_ASSERT(pn->pn_left->isKind(PNK_IMPORT_SPEC_LIST));
+    JS_ASSERT(pn->pn_right->isKind(PNK_STRING));
+
+    NodeVector elts(cx);
+    if (!elts.reserve(pn->pn_count))
+        return false;
+
+    for (ParseNode* next = pn->pn_left->pn_head; next; next = next->pn_next) {
+        RootedValue elt(cx);
+        if (!importSpecifier(next, &elt))
+            return false;
+        elts.infallibleAppend(elt);
+    }
+
+    RootedValue moduleSpec(cx);
+    return literal(pn->pn_right, &moduleSpec) &&
+           builder.importDeclaration(elts, moduleSpec, &pn->pn_pos, dst);
+}
+
+bool
+ASTSerializer::importSpecifier(ParseNode* pn, MutableHandleValue dst)
+{
+    JS_ASSERT(pn->isKind(PNK_IMPORT_SPEC));
+
+    RootedValue importName(cx);
+    RootedValue bindingName(cx);
+    return identifier(pn->pn_left, &importName) &&
+           identifier(pn->pn_right, &bindingName) &&
+           builder.importSpecifier(importName, bindingName, &pn->pn_pos, dst);
+}
+
+bool
+ASTSerializer::exportDeclaration(ParseNode* pn, MutableHandleValue dst)
+{
+    JS_ASSERT(pn->isKind(PNK_EXPORT) || pn->isKind(PNK_EXPORT_FROM));
+    JS_ASSERT_IF(pn->isKind(PNK_EXPORT_FROM), pn->pn_right->isKind(PNK_STRING));
+
+    RootedValue decl(cx, NullValue());
+    NodeVector elts(cx);
+
+    ParseNode* kid = pn->isKind(PNK_EXPORT) ? pn->pn_kid : pn->pn_left;
+    switch (ParseNodeKind kind = kid->getKind()) {
+      case PNK_EXPORT_SPEC_LIST:
+        if (!elts.reserve(pn->pn_count))
+            return false;
+
+        for (ParseNode* next = pn->pn_left->pn_head; next; next = next->pn_next) {
+            RootedValue elt(cx);
+            if (next->isKind(PNK_EXPORT_SPEC)) {
+                if (!exportSpecifier(next, &elt))
+                    return false;
+            } else {
+                if (!builder.exportBatchSpecifier(&pn->pn_pos, &elt))
+                    return false;
+            }
+            elts.infallibleAppend(elt);
+        }
+        break;
+
+      case PNK_FUNCTION:
+        if (!function(kid, AST_FUNC_DECL, &decl))
+            return false;
+        break;
+
+      case PNK_VAR:
+      case PNK_CONST:
+      case PNK_LET:
+        if (!variableDeclaration(kid, kind == PNK_LET, &decl))
+            return false;
+        break;
+
+      default:
+        LOCAL_NOT_REACHED("unexpected statement type");
+    }
+
+    RootedValue moduleSpec(cx, NullValue());
+    if (pn->isKind(PNK_EXPORT_FROM) && !literal(pn->pn_right, &moduleSpec))
+        return false;
+
+    return builder.exportDeclaration(decl, elts, moduleSpec, &pn->pn_pos, dst);
+}
+
+bool
+ASTSerializer::exportSpecifier(ParseNode* pn, MutableHandleValue dst)
+{
+    JS_ASSERT(pn->isKind(PNK_EXPORT_SPEC));
+
+    RootedValue bindingName(cx);
+    RootedValue exportName(cx);
+    return identifier(pn->pn_left, &bindingName) &&
+           identifier(pn->pn_right, &exportName) &&
+           builder.exportSpecifier(bindingName, exportName, &pn->pn_pos, dst);
+}
+
+bool
+ASTSerializer::switchCase(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT_IF(pn->pn_left, pn->pn_pos.encloses(pn->pn_left->pn_pos));
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_right->pn_pos));
@@ -1878,7 +2111,7 @@ ASTSerializer::switchCase(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::switchStatement(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::switchStatement(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_left->pn_pos));
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_right->pn_pos));
@@ -1888,7 +2121,7 @@ ASTSerializer::switchStatement(ParseNode *pn, MutableHandleValue dst)
     if (!expression(pn->pn_left, &disc))
         return false;
 
-    ParseNode *listNode;
+    ParseNode* listNode;
     bool lexical;
 
     if (pn->pn_right->isKind(PNK_LEXICALSCOPE)) {
@@ -1903,7 +2136,7 @@ ASTSerializer::switchStatement(ParseNode *pn, MutableHandleValue dst)
     if (!cases.reserve(listNode->pn_count))
         return false;
 
-    for (ParseNode *next = listNode->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = listNode->pn_head; next; next = next->pn_next) {
         RootedValue child(cx);
         if (!switchCase(next, &child))
             return false;
@@ -1914,7 +2147,7 @@ ASTSerializer::switchStatement(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::catchClause(ParseNode *pn, bool *isGuarded, MutableHandleValue dst)
+ASTSerializer::catchClause(ParseNode* pn, bool* isGuarded, MutableHandleValue dst)
 {
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_kid1->pn_pos));
     JS_ASSERT_IF(pn->pn_kid2, pn->pn_pos.encloses(pn->pn_kid2->pn_pos));
@@ -1922,7 +2155,7 @@ ASTSerializer::catchClause(ParseNode *pn, bool *isGuarded, MutableHandleValue ds
 
     RootedValue var(cx), guard(cx), body(cx);
 
-    if (!pattern(pn->pn_kid1, NULL, &var) ||
+    if (!pattern(pn->pn_kid1, nullptr, &var) ||
         !optExpression(pn->pn_kid2, &guard)) {
         return false;
     }
@@ -1934,7 +2167,7 @@ ASTSerializer::catchClause(ParseNode *pn, bool *isGuarded, MutableHandleValue ds
 }
 
 bool
-ASTSerializer::tryStatement(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::tryStatement(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT(pn->pn_pos.encloses(pn->pn_kid1->pn_pos));
     JS_ASSERT_IF(pn->pn_kid2, pn->pn_pos.encloses(pn->pn_kid2->pn_pos));
@@ -1951,7 +2184,7 @@ ASTSerializer::tryStatement(ParseNode *pn, MutableHandleValue dst)
         if (!guarded.reserve(pn->pn_kid2->pn_count))
             return false;
 
-        for (ParseNode *next = pn->pn_kid2->pn_head; next; next = next->pn_next) {
+        for (ParseNode* next = pn->pn_kid2->pn_head; next; next = next->pn_next) {
             RootedValue clause(cx);
             bool isGuarded;
             if (!catchClause(next->pn_expr, &isGuarded, &clause))
@@ -1969,7 +2202,7 @@ ASTSerializer::tryStatement(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::forInit(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::forInit(ParseNode* pn, MutableHandleValue dst)
 {
     if (!pn) {
         dst.setMagic(JS_SERIALIZE_NO_NODE);
@@ -1982,27 +2215,31 @@ ASTSerializer::forInit(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::forOfOrIn(ParseNode *loop, ParseNode *head, HandleValue var, HandleValue stmt,
+ASTSerializer::forOf(ParseNode* loop, ParseNode* head, HandleValue var, HandleValue stmt,
+                         MutableHandleValue dst)
+{
+    RootedValue expr(cx);
+
+    return expression(head->pn_kid3, &expr) &&
+        builder.forOfStatement(var, expr, stmt, &loop->pn_pos, dst);
+}
+
+bool
+ASTSerializer::forIn(ParseNode* loop, ParseNode* head, HandleValue var, HandleValue stmt,
                          MutableHandleValue dst)
 {
     RootedValue expr(cx);
     bool isForEach = loop->pn_iflags & JSITER_FOREACH;
-    bool isForOf = loop->pn_iflags & JSITER_FOR_OF;
-    JS_ASSERT(!isForOf || !isForEach);
 
     return expression(head->pn_kid3, &expr) &&
-        (isForOf ? builder.forOfStatement(var, expr, stmt, &loop->pn_pos, dst) :
-         builder.forInStatement(var, expr, stmt, isForEach, &loop->pn_pos, dst));
+        builder.forInStatement(var, expr, stmt, isForEach, &loop->pn_pos, dst);
 }
 
 bool
-ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::statement(ParseNode* pn, MutableHandleValue dst)
 {
     JS_CHECK_RECURSION(cx, return false);
     switch (pn->getKind()) {
-      case PNK_MODULE:
-        return module(pn, dst);
-
       case PNK_FUNCTION:
       case PNK_VAR:
       case PNK_CONST:
@@ -2012,6 +2249,13 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
         return pn->isArity(PN_BINARY)
                ? let(pn, false, dst)
                : declaration(pn, dst);
+
+      case PNK_IMPORT:
+        return importDeclaration(pn, dst);
+
+      case PNK_EXPORT:
+      case PNK_EXPORT_FROM:
+        return exportDeclaration(pn, dst);
 
       case PNK_NAME:
         LOCAL_ASSERT(pn->isUsed());
@@ -2086,7 +2330,7 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
         JS_ASSERT(pn->pn_pos.encloses(pn->pn_left->pn_pos));
         JS_ASSERT(pn->pn_pos.encloses(pn->pn_right->pn_pos));
 
-        ParseNode *head = pn->pn_left;
+        ParseNode* head = pn->pn_left;
 
         JS_ASSERT_IF(head->pn_kid1, head->pn_pos.encloses(head->pn_kid1->pn_pos));
         JS_ASSERT_IF(head->pn_kid2, head->pn_pos.encloses(head->pn_kid2->pn_pos));
@@ -2099,11 +2343,21 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
         if (head->isKind(PNK_FORIN)) {
             RootedValue var(cx);
             return (!head->pn_kid1
-                    ? pattern(head->pn_kid2, NULL, &var)
+                    ? pattern(head->pn_kid2, nullptr, &var)
                     : head->pn_kid1->isKind(PNK_LEXICALSCOPE)
                     ? variableDeclaration(head->pn_kid1->pn_expr, true, &var)
                     : variableDeclaration(head->pn_kid1, false, &var)) &&
-                forOfOrIn(pn, head, var, stmt, dst);
+                forIn(pn, head, var, stmt, dst);
+        }
+
+        if (head->isKind(PNK_FOROF)) {
+            RootedValue var(cx);
+            return (!head->pn_kid1
+                    ? pattern(head->pn_kid2, nullptr, &var)
+                    : head->pn_kid1->isKind(PNK_LEXICALSCOPE)
+                    ? variableDeclaration(head->pn_kid1->pn_expr, true, &var)
+                    : variableDeclaration(head->pn_kid1, false, &var)) &&
+                forOf(pn, head, var, stmt, dst);
         }
 
         RootedValue init(cx), test(cx), update(cx);
@@ -2119,8 +2373,8 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
       {
         LOCAL_ASSERT(pn->pn_count == 2);
 
-        ParseNode *prelude = pn->pn_head;
-        ParseNode *loop = prelude->pn_next;
+        ParseNode* prelude = pn->pn_head;
+        ParseNode* loop = prelude->pn_next;
 
         LOCAL_ASSERT(prelude->isKind(PNK_VAR) && loop->isKind(PNK_FOR));
 
@@ -2128,12 +2382,12 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
         if (!variableDeclaration(prelude, false, &var))
             return false;
 
-        ParseNode *head = loop->pn_left;
+        ParseNode* head = loop->pn_left;
         JS_ASSERT(head->isKind(PNK_FORIN));
 
         RootedValue stmt(cx);
 
-        return statement(loop->pn_right, &stmt) && forOfOrIn(loop, head, var, stmt, dst);
+        return statement(loop->pn_right, &stmt) && forIn(loop, head, var, stmt, dst);
       }
 
       case PNK_BREAK:
@@ -2141,7 +2395,7 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
       {
         RootedValue label(cx);
         RootedAtom pnAtom(cx, pn->pn_atom);
-        return optIdentifier(pnAtom, NULL, &label) &&
+        return optIdentifier(pnAtom, nullptr, &label) &&
                (pn->isKind(PNK_BREAK)
                 ? builder.breakStatement(label, &pn->pn_pos, dst)
                 : builder.continueStatement(label, &pn->pn_pos, dst));
@@ -2153,7 +2407,7 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
 
         RootedValue label(cx), stmt(cx);
         RootedAtom pnAtom(cx, pn->as<LabeledStatement>().label());
-        return identifier(pnAtom, NULL, &label) &&
+        return identifier(pnAtom, nullptr, &label) &&
                statement(pn->pn_expr, &stmt) &&
                builder.labeledStatement(label, stmt, &pn->pn_pos, dst);
       }
@@ -2183,7 +2437,7 @@ ASTSerializer::statement(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::leftAssociate(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::leftAssociate(ParseNode* pn, MutableHandleValue dst)
 {
     JS_ASSERT(pn->isArity(PN_LIST));
     JS_ASSERT(pn->pn_count >= 1);
@@ -2192,11 +2446,11 @@ ASTSerializer::leftAssociate(ParseNode *pn, MutableHandleValue dst)
     bool lor = kind == PNK_OR;
     bool logop = lor || (kind == PNK_AND);
 
-    ParseNode *head = pn->pn_head;
+    ParseNode* head = pn->pn_head;
     RootedValue left(cx);
     if (!expression(head, &left))
         return false;
-    for (ParseNode *next = head->pn_next; next; next = next->pn_next) {
+    for (ParseNode* next = head->pn_next; next; next = next->pn_next) {
         RootedValue right(cx);
         if (!expression(next, &right))
             return false;
@@ -2220,31 +2474,31 @@ ASTSerializer::leftAssociate(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::comprehensionBlock(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::comprehensionBlock(ParseNode* pn, MutableHandleValue dst)
 {
     LOCAL_ASSERT(pn->isArity(PN_BINARY));
 
-    ParseNode *in = pn->pn_left;
+    ParseNode* in = pn->pn_left;
 
-    LOCAL_ASSERT(in && in->isKind(PNK_FORIN));
+    LOCAL_ASSERT(in && (in->isKind(PNK_FORIN) || in->isKind(PNK_FOROF)));
 
     bool isForEach = pn->pn_iflags & JSITER_FOREACH;
-    bool isForOf = pn->pn_iflags & JSITER_FOR_OF;
+    bool isForOf = in->isKind(PNK_FOROF);
 
     RootedValue patt(cx), src(cx);
-    return pattern(in->pn_kid2, NULL, &patt) &&
+    return pattern(in->pn_kid2, nullptr, &patt) &&
            expression(in->pn_kid3, &src) &&
            builder.comprehensionBlock(patt, src, isForEach, isForOf, &in->pn_pos, dst);
 }
 
 bool
-ASTSerializer::comprehension(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::comprehension(ParseNode* pn, MutableHandleValue dst)
 {
     LOCAL_ASSERT(pn->isKind(PNK_FOR));
 
     NodeVector blocks(cx);
 
-    ParseNode *next = pn;
+    ParseNode* next = pn;
     while (next->isKind(PNK_FOR)) {
         RootedValue block(cx);
         if (!comprehensionBlock(next, &block) || !blocks.append(block))
@@ -2273,13 +2527,13 @@ ASTSerializer::comprehension(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::generatorExpression(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::generatorExpression(ParseNode* pn, MutableHandleValue dst)
 {
     LOCAL_ASSERT(pn->isKind(PNK_FOR));
 
     NodeVector blocks(cx);
 
-    ParseNode *next = pn;
+    ParseNode* next = pn;
     while (next->isKind(PNK_FOR)) {
         RootedValue block(cx);
         if (!comprehensionBlock(next, &block) || !blocks.append(block))
@@ -2306,7 +2560,7 @@ ASTSerializer::generatorExpression(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::expression(ParseNode* pn, MutableHandleValue dst)
 {
     JS_CHECK_RECURSION(cx, return false);
     switch (pn->getKind()) {
@@ -2394,7 +2648,7 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
         LOCAL_ASSERT(op > AOP_ERR && op < AOP_LIMIT);
 
         RootedValue lhs(cx), rhs(cx);
-        return pattern(pn->pn_left, NULL, &lhs) &&
+        return pattern(pn->pn_left, nullptr, &lhs) &&
                expression(pn->pn_right, &rhs) &&
                builder.assignmentExpression(op, lhs, rhs, &pn->pn_pos, dst);
       }
@@ -2459,7 +2713,7 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
       case PNK_NEW:
       case PNK_CALL:
       {
-        ParseNode *next = pn->pn_head;
+        ParseNode* next = pn->pn_head;
         JS_ASSERT(pn->pn_pos.encloses(next->pn_pos));
 
         RootedValue callee(cx);
@@ -2492,7 +2746,7 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
         RootedValue expr(cx), id(cx);
         RootedAtom pnAtom(cx, pn->pn_atom);
         return expression(pn->pn_expr, &expr) &&
-               identifier(pnAtom, NULL, &id) &&
+               identifier(pnAtom, nullptr, &id) &&
                builder.memberExpression(false, expr, id, &pn->pn_pos, dst);
       }
 
@@ -2513,7 +2767,7 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
         if (!elts.reserve(pn->pn_count))
             return false;
 
-        for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+        for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
             JS_ASSERT(pn->pn_pos.encloses(next->pn_pos));
 
             if (next->isKind(PNK_ELISION)) {
@@ -2540,14 +2794,14 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
       {
         /* The parser notes any uninitialized properties by setting the PNX_DESTRUCT flag. */
         if (pn->pn_xflags & PNX_DESTRUCT) {
-            JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_BAD_OBJECT_INIT);
+            JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_BAD_OBJECT_INIT);
             return false;
         }
         NodeVector elts(cx);
         if (!elts.reserve(pn->pn_count))
             return false;
 
-        for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+        for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
             JS_ASSERT(pn->pn_pos.encloses(next->pn_pos));
 
             RootedValue prop(cx);
@@ -2573,13 +2827,22 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
       case PNK_NULL:
         return literal(pn, dst);
 
+      case PNK_YIELD_STAR:
+      {
+        JS_ASSERT(pn->pn_pos.encloses(pn->pn_kid->pn_pos));
+
+        RootedValue arg(cx);
+        return expression(pn->pn_kid, &arg) &&
+               builder.yieldExpression(arg, Delegating, &pn->pn_pos, dst);
+      }
+
       case PNK_YIELD:
       {
         JS_ASSERT_IF(pn->pn_kid, pn->pn_pos.encloses(pn->pn_kid->pn_pos));
 
         RootedValue arg(cx);
         return optExpression(pn->pn_kid, &arg) &&
-               builder.yieldExpression(arg, &pn->pn_pos, dst);
+               builder.yieldExpression(arg, NotDelegating, &pn->pn_pos, dst);
       }
 
       case PNK_ARRAYCOMP:
@@ -2600,7 +2863,7 @@ ASTSerializer::expression(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::propertyName(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::propertyName(ParseNode* pn, MutableHandleValue dst)
 {
     if (pn->isKind(PNK_NAME))
         return identifier(pn, dst);
@@ -2611,7 +2874,7 @@ ASTSerializer::propertyName(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::property(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::property(ParseNode* pn, MutableHandleValue dst)
 {
     PropKind kind;
     switch (pn->getOp()) {
@@ -2638,7 +2901,7 @@ ASTSerializer::property(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::literal(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::literal(ParseNode* pn, MutableHandleValue dst)
 {
     RootedValue val(cx);
     switch (pn->getKind()) {
@@ -2651,11 +2914,7 @@ ASTSerializer::literal(ParseNode *pn, MutableHandleValue dst)
         RootedObject re1(cx, pn->as<RegExpLiteral>().objbox()->object);
         LOCAL_ASSERT(re1 && re1->is<RegExpObject>());
 
-        RootedObject proto(cx);
-        if (!js_GetClassPrototype(cx, JSProto_RegExp, &proto))
-            return false;
-
-        RootedObject re2(cx, CloneRegExpObject(cx, re1, proto));
+        RootedObject re2(cx, CloneRegExpObject(cx, re1));
         if (!re2)
             return false;
 
@@ -2687,7 +2946,7 @@ ASTSerializer::literal(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::arrayPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst)
+ASTSerializer::arrayPattern(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst)
 {
     JS_ASSERT(pn->isKind(PNK_ARRAY));
 
@@ -2695,7 +2954,7 @@ ASTSerializer::arrayPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValu
     if (!elts.reserve(pn->pn_count))
         return false;
 
-    for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
         if (next->isKind(PNK_ELISION)) {
             elts.infallibleAppend(NullValue());
         } else {
@@ -2710,7 +2969,7 @@ ASTSerializer::arrayPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValu
 }
 
 bool
-ASTSerializer::objectPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst)
+ASTSerializer::objectPattern(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst)
 {
     JS_ASSERT(pn->isKind(PNK_OBJECT));
 
@@ -2718,7 +2977,7 @@ ASTSerializer::objectPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleVal
     if (!elts.reserve(pn->pn_count))
         return false;
 
-    for (ParseNode *next = pn->pn_head; next; next = next->pn_next) {
+    for (ParseNode* next = pn->pn_head; next; next = next->pn_next) {
         LOCAL_ASSERT(next->isOp(JSOP_INITPROP));
 
         RootedValue key(cx), patt(cx), prop(cx);
@@ -2735,7 +2994,7 @@ ASTSerializer::objectPattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleVal
 }
 
 bool
-ASTSerializer::pattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst)
+ASTSerializer::pattern(ParseNode* pn, VarDeclKind* pkind, MutableHandleValue dst)
 {
     JS_CHECK_RECURSION(cx, return false);
     switch (pn->getKind()) {
@@ -2756,14 +3015,14 @@ ASTSerializer::pattern(ParseNode *pn, VarDeclKind *pkind, MutableHandleValue dst
 }
 
 bool
-ASTSerializer::identifier(HandleAtom atom, TokenPos *pos, MutableHandleValue dst)
+ASTSerializer::identifier(HandleAtom atom, TokenPos* pos, MutableHandleValue dst)
 {
     RootedValue atomContentsVal(cx, unrootedAtomContents(atom));
     return builder.identifier(atomContentsVal, pos, dst);
 }
 
 bool
-ASTSerializer::identifier(ParseNode *pn, MutableHandleValue dst)
+ASTSerializer::identifier(ParseNode* pn, MutableHandleValue dst)
 {
     LOCAL_ASSERT(pn->isArity(PN_NAME) || pn->isArity(PN_NULLARY));
     LOCAL_ASSERT(pn->pn_atom);
@@ -2773,25 +3032,12 @@ ASTSerializer::identifier(ParseNode *pn, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::module(ParseNode *pn, MutableHandleValue dst)
-{
-    RootedValue name(cx, StringValue(pn->atom()));
-    RootedValue body(cx);
-    return moduleOrFunctionBody(pn->pn_body->pn_head, &pn->pn_body->pn_pos, &body) &&
-           builder.module(&pn->pn_pos, name, body, dst);
-}
-
-bool
-ASTSerializer::function(ParseNode *pn, ASTType type, MutableHandleValue dst)
+ASTSerializer::function(ParseNode* pn, ASTType type, MutableHandleValue dst)
 {
     RootedFunction func(cx, pn->pn_funbox->function());
 
-    bool isGenerator =
-#if JS_HAS_GENERATORS
-        pn->pn_funbox->isGenerator();
-#else
-        false;
-#endif
+    // FIXME: Provide more information (legacy generator vs star generator).
+    bool isGenerator = pn->pn_funbox->isGenerator();
 
     bool isExpression =
 #if JS_HAS_EXPR_CLOSURES
@@ -2802,7 +3048,7 @@ ASTSerializer::function(ParseNode *pn, ASTType type, MutableHandleValue dst)
 
     RootedValue id(cx);
     RootedAtom funcAtom(cx, func->atom());
-    if (!optIdentifier(funcAtom, NULL, &id))
+    if (!optIdentifier(funcAtom, nullptr, &id))
         return false;
 
     NodeVector args(cx);
@@ -2819,44 +3065,44 @@ ASTSerializer::function(ParseNode *pn, ASTType type, MutableHandleValue dst)
 }
 
 bool
-ASTSerializer::functionArgsAndBody(ParseNode *pn, NodeVector &args, NodeVector &defaults,
+ASTSerializer::functionArgsAndBody(ParseNode* pn, NodeVector& args, NodeVector& defaults,
                                    MutableHandleValue body, MutableHandleValue rest)
 {
-    ParseNode *pnargs;
-    ParseNode *pnbody;
+    ParseNode* pnargs;
+    ParseNode* pnbody;
 
     /* Extract the args and body separately. */
     if (pn->isKind(PNK_ARGSBODY)) {
         pnargs = pn;
         pnbody = pn->last();
     } else {
-        pnargs = NULL;
+        pnargs = nullptr;
         pnbody = pn;
     }
 
-    ParseNode *pndestruct;
+    ParseNode* pndestruct;
 
     /* Extract the destructuring assignments. */
     if (pnbody->isArity(PN_LIST) && (pnbody->pn_xflags & PNX_DESTRUCT)) {
-        ParseNode *head = pnbody->pn_head;
+        ParseNode* head = pnbody->pn_head;
         LOCAL_ASSERT(head && head->isKind(PNK_SEMI));
 
         pndestruct = head->pn_kid;
         LOCAL_ASSERT(pndestruct);
         LOCAL_ASSERT(pndestruct->isKind(PNK_VAR));
     } else {
-        pndestruct = NULL;
+        pndestruct = nullptr;
     }
 
     /* Serialize the arguments and body. */
     switch (pnbody->getKind()) {
       case PNK_RETURN: /* expression closure, no destructured args */
-        return functionArgs(pn, pnargs, NULL, pnbody, args, defaults, rest) &&
+        return functionArgs(pn, pnargs, nullptr, pnbody, args, defaults, rest) &&
                expression(pnbody->pn_kid, body);
 
       case PNK_SEQ:    /* expression closure with destructured args */
       {
-        ParseNode *pnstart = pnbody->pn_head->pn_next;
+        ParseNode* pnstart = pnbody->pn_head->pn_next;
         LOCAL_ASSERT(pnstart && pnstart->isKind(PNK_RETURN));
 
         return functionArgs(pn, pnargs, pndestruct, pnbody, args, defaults, rest) &&
@@ -2865,12 +3111,12 @@ ASTSerializer::functionArgsAndBody(ParseNode *pn, NodeVector &args, NodeVector &
 
       case PNK_STATEMENTLIST:     /* statement closure */
       {
-        ParseNode *pnstart = (pnbody->pn_xflags & PNX_DESTRUCT)
+        ParseNode* pnstart = (pnbody->pn_xflags & PNX_DESTRUCT)
                                ? pnbody->pn_head->pn_next
                                : pnbody->pn_head;
 
         return functionArgs(pn, pnargs, pndestruct, pnbody, args, defaults, rest) &&
-               moduleOrFunctionBody(pnstart, &pnbody->pn_pos, body);
+               functionBody(pnstart, &pnbody->pn_pos, body);
       }
 
       default:
@@ -2879,13 +3125,13 @@ ASTSerializer::functionArgsAndBody(ParseNode *pn, NodeVector &args, NodeVector &
 }
 
 bool
-ASTSerializer::functionArgs(ParseNode *pn, ParseNode *pnargs, ParseNode *pndestruct,
-                            ParseNode *pnbody, NodeVector &args, NodeVector &defaults,
+ASTSerializer::functionArgs(ParseNode* pn, ParseNode* pnargs, ParseNode* pndestruct,
+                            ParseNode* pnbody, NodeVector& args, NodeVector& defaults,
                             MutableHandleValue rest)
 {
     uint32_t i = 0;
-    ParseNode *arg = pnargs ? pnargs->pn_head : NULL;
-    ParseNode *destruct = pndestruct ? pndestruct->pn_head : NULL;
+    ParseNode* arg = pnargs ? pnargs->pn_head : nullptr;
+    ParseNode* destruct = pndestruct ? pndestruct->pn_head : nullptr;
     RootedValue node(cx);
 
     /*
@@ -2898,7 +3144,7 @@ ASTSerializer::functionArgs(ParseNode *pn, ParseNode *pnargs, ParseNode *pndestr
      */
     while ((arg && arg != pnbody) || destruct) {
         if (destruct && destruct->pn_right->frameSlot() == i) {
-            if (!pattern(destruct->pn_left, NULL, &node) || !args.append(node))
+            if (!pattern(destruct->pn_left, nullptr, &node) || !args.append(node))
                 return false;
             destruct = destruct->pn_next;
         } else if (arg && arg != pnbody) {
@@ -2914,7 +3160,7 @@ ASTSerializer::functionArgs(ParseNode *pn, ParseNode *pnargs, ParseNode *pndestr
              * ask destructuring args their index above.
              */
             JS_ASSERT(arg->isKind(PNK_NAME) || arg->isKind(PNK_ASSIGN));
-            ParseNode *argName = arg->isKind(PNK_NAME) ? arg : arg->pn_left;
+            ParseNode* argName = arg->isKind(PNK_NAME) ? arg : arg->pn_left;
             if (!identifier(argName, &node))
                 return false;
             if (rest.isUndefined() && arg->pn_next == pnbody)
@@ -2922,7 +3168,7 @@ ASTSerializer::functionArgs(ParseNode *pn, ParseNode *pnargs, ParseNode *pndestr
             else if (!args.append(node))
                 return false;
             if (arg->pn_dflags & PND_DEFAULT) {
-                ParseNode *expr = arg->isDefn() ? arg->expr() : arg->pn_kid->pn_right;
+                ParseNode* expr = arg->isDefn() ? arg->expr() : arg->pn_kid->pn_right;
                 RootedValue def(cx);
                 if (!expression(expr, &def) || !defaults.append(def))
                     return false;
@@ -2939,12 +3185,12 @@ ASTSerializer::functionArgs(ParseNode *pn, ParseNode *pnargs, ParseNode *pndestr
 }
 
 bool
-ASTSerializer::moduleOrFunctionBody(ParseNode *pn, TokenPos *pos, MutableHandleValue dst)
+ASTSerializer::functionBody(ParseNode* pn, TokenPos* pos, MutableHandleValue dst)
 {
     NodeVector elts(cx);
 
     /* We aren't sure how many elements there are up front, so we'll check each append. */
-    for (ParseNode *next = pn; next; next = next->pn_next) {
+    for (ParseNode* next = pn; next; next = next->pn_next) {
         RootedValue child(cx);
         if (!sourceElement(next, &child) || !elts.append(child))
             return false;
@@ -2953,20 +3199,20 @@ ASTSerializer::moduleOrFunctionBody(ParseNode *pn, TokenPos *pos, MutableHandleV
     return builder.blockStatement(elts, pos, dst);
 }
 
-static JSBool
-reflect_parse(JSContext *cx, uint32_t argc, jsval *vp)
+static bool
+reflect_parse(JSContext* cx, uint32_t argc, jsval* vp)
 {
     CallArgs args = CallArgsFromVp(argc, vp);
 
     if (args.length() < 1) {
-        JS_ReportErrorNumber(cx, js_GetErrorMessage, NULL, JSMSG_MORE_ARGS_NEEDED,
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_MORE_ARGS_NEEDED,
                              "Reflect.parse", "0", "s");
-        return JS_FALSE;
+        return false;
     }
 
-    RootedString src(cx, ToString<CanGC>(cx, args.handleAt(0)));
+    RootedString src(cx, ToString<CanGC>(cx, args[0]));
     if (!src)
-        return JS_FALSE;
+        return false;
 
     ScopedJSFreePtr<char> filename;
     uint32_t lineno = 1;
@@ -2979,8 +3225,9 @@ reflect_parse(JSContext *cx, uint32_t argc, jsval *vp)
     if (!arg.isNullOrUndefined()) {
         if (!arg.isObject()) {
             js_ReportValueErrorFlags(cx, JSREPORT_ERROR, JSMSG_UNEXPECTED_TYPE,
-                                     JSDVG_SEARCH_STACK, arg, NullPtr(), "not an object", NULL);
-            return JS_FALSE;
+                                     JSDVG_SEARCH_STACK, arg, js::NullPtr(),
+                                     "not an object", nullptr);
+            return false;
         }
 
         RootedObject config(cx, &arg.toObject());
@@ -2990,8 +3237,8 @@ reflect_parse(JSContext *cx, uint32_t argc, jsval *vp)
         /* config.loc */
         RootedId locId(cx, NameToId(cx->names().loc));
         RootedValue trueVal(cx, BooleanValue(true));
-        if (!baseops::GetPropertyDefault(cx, config, locId, trueVal, &prop))
-            return JS_FALSE;
+        if (!GetPropertyDefault(cx, config, locId, trueVal, &prop))
+            return false;
 
         loc = ToBoolean(prop);
 
@@ -2999,45 +3246,46 @@ reflect_parse(JSContext *cx, uint32_t argc, jsval *vp)
             /* config.source */
             RootedId sourceId(cx, NameToId(cx->names().source));
             RootedValue nullVal(cx, NullValue());
-            if (!baseops::GetPropertyDefault(cx, config, sourceId, nullVal, &prop))
-                return JS_FALSE;
+            if (!GetPropertyDefault(cx, config, sourceId, nullVal, &prop))
+                return false;
 
             if (!prop.isNullOrUndefined()) {
                 RootedString str(cx, ToString<CanGC>(cx, prop));
                 if (!str)
-                    return JS_FALSE;
+                    return false;
 
                 size_t length = str->length();
-                const jschar *chars = str->getChars(cx);
+                const jschar* chars = str->getChars(cx);
                 if (!chars)
-                    return JS_FALSE;
+                    return false;
 
                 TwoByteChars tbchars(chars, length);
                 filename = LossyTwoByteCharsToNewLatin1CharsZ(cx, tbchars).c_str();
                 if (!filename)
-                    return JS_FALSE;
+                    return false;
             }
 
             /* config.line */
             RootedId lineId(cx, NameToId(cx->names().line));
             RootedValue oneValue(cx, Int32Value(1));
-            if (!baseops::GetPropertyDefault(cx, config, lineId, oneValue, &prop) ||
+            if (!GetPropertyDefault(cx, config, lineId, oneValue, &prop) ||
                 !ToUint32(cx, prop, &lineno)) {
-                return JS_FALSE;
+                return false;
             }
         }
 
         /* config.builder */
         RootedId builderId(cx, NameToId(cx->names().builder));
         RootedValue nullVal(cx, NullValue());
-        if (!baseops::GetPropertyDefault(cx, config, builderId, nullVal, &prop))
-            return JS_FALSE;
+        if (!GetPropertyDefault(cx, config, builderId, nullVal, &prop))
+            return false;
 
         if (!prop.isNullOrUndefined()) {
             if (!prop.isObject()) {
                 js_ReportValueErrorFlags(cx, JSREPORT_ERROR, JSMSG_UNEXPECTED_TYPE,
-                                         JSDVG_SEARCH_STACK, prop, NullPtr(), "not an object", NULL);
-                return JS_FALSE;
+                                         JSDVG_SEARCH_STACK, prop, js::NullPtr(),
+                                         "not an object", nullptr);
+                return false;
             }
             builder = &prop.toObject();
         }
@@ -3046,56 +3294,57 @@ reflect_parse(JSContext *cx, uint32_t argc, jsval *vp)
     /* Extract the builder methods first to report errors before parsing. */
     ASTSerializer serialize(cx, loc, filename, lineno);
     if (!serialize.init(builder))
-        return JS_FALSE;
+        return false;
 
-    JSStableString *stable = src->ensureStable(cx);
-    if (!stable)
-        return JS_FALSE;
+    JSFlatString* flat = src->ensureFlat(cx);
+    if (!flat)
+        return false;
 
-    const StableCharPtr chars = stable->chars();
-    size_t length = stable->length();
     CompileOptions options(cx);
     options.setFileAndLine(filename, lineno);
     options.setCanLazilyParse(false);
-    Parser<FullParseHandler> parser(cx, options, chars.get(), length,
-                                    /* foldConstants = */ false, NULL, NULL);
+    Parser<FullParseHandler> parser(cx, &cx->tempLifoAlloc(), options, flat->chars(),
+                                    flat->length(), /* foldConstants = */ false, nullptr, nullptr);
 
     serialize.setParser(&parser);
 
-    ParseNode *pn = parser.parse(NULL);
+    ParseNode* pn = parser.parse(nullptr);
     if (!pn)
-        return JS_FALSE;
+        return false;
 
     RootedValue val(cx);
     if (!serialize.program(pn, &val)) {
         args.rval().setNull();
-        return JS_FALSE;
+        return false;
     }
 
     args.rval().set(val);
-    return JS_TRUE;
+    return true;
 }
 
-static const JSFunctionSpec static_methods[] = {
-    JS_FN("parse", reflect_parse, 1, 0),
-    JS_FS_END
-};
-
-JS_PUBLIC_API(JSObject *)
-JS_InitReflect(JSContext *cx, JSObject *objArg)
+JS_PUBLIC_API(JSObject*)
+JS_InitReflect(JSContext* cx, HandleObject obj)
 {
-    RootedObject obj(cx, objArg);
-    RootedObject Reflect(cx, NewObjectWithClassProto(cx, &ObjectClass, NULL, obj, SingletonObject));
-    if (!Reflect)
-        return NULL;
+    static const JSFunctionSpec static_methods[] = {
+        JS_FN("parse", reflect_parse, 1, 0),
+        JS_FS_END
+    };
 
-    if (!JS_DefineProperty(cx, obj, "Reflect", OBJECT_TO_JSVAL(Reflect),
-                           JS_PropertyStub, JS_StrictPropertyStub, 0)) {
-        return NULL;
+    RootedObject proto(cx, obj->as<GlobalObject>().getOrCreateObjectPrototype(cx));
+    if (!proto)
+        return nullptr;
+    RootedObject Reflect(cx, NewObjectWithGivenProto(cx, &JSObject::class_, proto,
+                                                     obj, SingletonObject));
+    if (!Reflect)
+        return nullptr;
+
+    if (!JS_DefineProperty(cx, obj, "Reflect", Reflect, 0,
+                           JS_PropertyStub, JS_StrictPropertyStub)) {
+        return nullptr;
     }
 
     if (!JS_DefineFunctions(cx, Reflect, static_methods))
-        return NULL;
+        return nullptr;
 
     return Reflect;
 }
