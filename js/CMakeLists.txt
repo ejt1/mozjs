@@ -9,10 +9,13 @@ if(CMAKE_SIZEOF_VOID_P MATCHES 8)
 else()
   add_definitions(-D_X86_)
 endif()
+add_definitions(-DMOZILLA_VERSION="24.8.1")
 ## End definitions
 ###############################################################################
 ## Begin source files
 set(JS_SRCS
+  src/assembler/jit/ExecutableAllocator.cpp
+
   src/builtin/Eval.cpp
   src/builtin/Intl.cpp
   src/builtin/MapObject.cpp
@@ -42,9 +45,10 @@ set(JS_SRCS
   src/vm/Debugger.cpp
   src/vm/ForkJoin.cpp
   src/vm/GlobalObject.cpp
+  src/vm/Interpreter.cpp
   src/vm/Monitor.cpp
   src/vm/ObjectImpl.cpp
-  src/vm/ParallelDo.cpp
+  src/vm/Probes.cpp
   src/vm/PropertyKey.cpp
   src/vm/RegExpObject.cpp
   src/vm/RegExpStatics.cpp
@@ -62,10 +66,18 @@ set(JS_SRCS
   src/gc/Iteration.cpp
   src/gc/Marking.cpp
   src/gc/Memory.cpp
+  src/gc/Nursery.cpp
   src/gc/RootMarking.cpp
   src/gc/Statistics.cpp
   src/gc/StoreBuffer.cpp
   src/gc/Verifier.cpp
+  src/gc/Zone.cpp
+
+  src/yarr/PageBlock.cpp
+  src/yarr/YarrCanonicalizeUCS2.cpp
+  src/yarr/YarrInterpreter.cpp
+  src/yarr/YarrPattern.cpp
+  src/yarr/YarrSyntaxChecker.cpp
   
   src/jsalloc.cpp
   src/jsanalyze.cpp
@@ -79,16 +91,13 @@ set(JS_SRCS
   src/jscrashreport.cpp
   src/jsdate.cpp
   src/jsdbgapi.cpp
-  src/jsdhash.cpp
   src/jsdtoa.cpp
   src/jsexn.cpp
   src/jsfriendapi.cpp
   src/jsfun.cpp
   src/jsgc.cpp
   src/jsinfer.cpp
-  src/jsinterp.cpp
   src/jsiter.cpp
-  src/jslog2.cpp
   src/jsmath.cpp
   src/jsmemorymetrics.cpp
   src/jsnativestack.cpp
@@ -98,8 +107,6 @@ set(JS_SRCS
   src/jsonparser.cpp
   src/jsopcode.cpp
   src/jsprf.cpp
-  src/jsprobes.cpp
-  src/jspropertycache.cpp
   src/jspropertytree.cpp
   src/jsproxy.cpp
   src/jsreflect.cpp
@@ -113,121 +120,103 @@ set(JS_SRCS
   src/jswrapper.cpp
   src/prmjtime.cpp)
 
+if(MOZ_INSTRUMENTS)
+  list(APPEND JS_SRCS
+    src/devtools/Instruments.cpp)
+endif()
+
 if(ENABLE_TRACE_LOGGING)
   list(APPEND JS_SRCS
     src/TraceLogging.cpp)
 endif()
 
-if(ENABLE_METHODJIT)
+if(ENABLE_ION)
   list(APPEND JS_SRCS
-     src/methodjit/Compiler.cpp
-     src/methodjit/FastArithmetic.cpp
-     src/methodjit/FastBuiltins.cpp
-     src/methodjit/FastOps.cpp
-     src/methodjit/FrameState.cpp
-     src/methodjit/ImmutableSync.cpp
-     src/methodjit/InvokeHelpers.cpp
-     src/methodjit/LoopState.cpp
-     src/methodjit/MethodJIT.cpp
-     src/methodjit/MonoIC.cpp
-     src/methodjit/PolyIC.cpp
-     src/methodjit/Retcon.cpp
-     src/methodjit/StubCalls.cpp
-     src/methodjit/StubCompiler.cpp
-     src/methodjit/TrampolineCompiler.cpp)
+    src/jit/shared/CodeGenerator-shared.cpp
+    src/jit/shared/Lowering-shared.cpp
+    # TODO: Platform specific sources
 
-  if(ENABLE_ION)
+    src/jit/AliasAnalysis.cpp
+    src/jit/AsmJS.cpp
+    src/jit/AsmJSLink.cpp
+    src/jit/AsmJSSignalHandlers.cpp
+    src/jit/BacktracingAllocator.cpp
+    src/jit/Bailouts.cpp
+    src/jit/BaselineBailout.cpp
+    src/jit/BaselineCompiler.cpp
+    src/jit/BaselineFrame.cpp
+    src/jit/BaselineFrameInfo.cpp
+    src/jit/BaselineIC.cpp
+    src/jit/BaselineInspector.cpp
+    src/jit/BaselineJIT.cpp
+    src/jit/BitSet.cpp
+    src/jit/BytecodeAnalysis.cpp
+    src/jit/C1Spewer.cpp
+    src/jit/CodeGenerator.cpp
+    src/jit/EdgeCaseAnalysis.cpp
+    src/jit/EffectiveAddressAnalysis.cpp
+    src/jit/Ion.cpp
+    src/jit/IonAnalysis.cpp
+    src/jit/IonBuilder.cpp
+    src/jit/IonCaches.cpp
+    src/jit/IonFrames.cpp
+    src/jit/IonMacroAssembler.cpp
+    src/jit/IonSpewer.cpp
+    src/jit/JSONSpewer.cpp
+    src/jit/LICM.cpp
+    src/jit/LinearScan.cpp
+    src/jit/LIR.cpp
+    src/jit/LiveRangeAllocator.cpp
+    src/jit/Lowering.cpp
+    src/jit/MCallOptimize.cpp
+    src/jit/MIR.cpp
+    src/jit/MIRGraph.cpp
+    src/jit/MoveResolver.cpp
+    src/jit/ParallelArrayAnalysis.cpp
+    src/jit/ParallelFunctions.cpp
+    src/jit/PerfSpewer.cpp
+    src/jit/RangeAnalysis.cpp
+    src/jit/RegisterAllocator.cpp
+    src/jit/Safepoints.cpp
+    src/jit/Snapshots.cpp
+    src/jit/StupidAllocator.cpp
+    src/jit/TypePolicy.cpp
+    src/jit/UnreachableCodeElimination.cpp
+    src/jit/ValueNumbering.cpp
+    src/jit/VMFunctions.cpp)
+
+  # x86 or x86_64
+  #if CONFIG['TARGET_CPU'].find('86') != -1:
+  list(APPEND JS_SRCS
+    src/jit/shared/Assembler-x86-shared.cpp
+    src/jit/shared/BaselineCompiler-x86-shared.cpp
+    src/jit/shared/BaselineIC-x86-shared.cpp
+    src/jit/shared/CodeGenerator-x86-shared.cpp
+    src/jit/shared/IonFrames-x86-shared.cpp
+    src/jit/shared/Lowering-x86-shared.cpp
+    src/jit/shared/MoveEmitter-x86-shared.cpp)
+
+  if(PLATFORM_ARCH MATCHES 64)
     list(APPEND JS_SRCS
-      src/ion/shared/CodeGenerator-shared.cpp
-      src/ion/shared/Lowering-shared.cpp
-      # TODO: Platform specific sources
-
-      src/ion/AliasAnalysis.cpp
-      src/ion/BacktracingAllocator.cpp
-      src/ion/Bailouts.cpp
-      src/ion/BaselineJIT.cpp
-      src/ion/BitSet.cpp
-      src/ion/C1Spewer.cpp
-      src/ion/CodeGenerator.cpp
-      src/ion/EdgeCaseAnalysis.cpp
-      src/ion/Ion.cpp
-      src/ion/IonAnalysis.cpp
-      src/ion/IonBuilder.cpp
-      src/ion/IonCaches.cpp
-      src/ion/IonFrames.cpp
-      src/ion/IonMacroAssembler.cpp
-      src/ion/IonSpewer.cpp
-      src/ion/JSONSpewer.cpp
-      src/ion/LICM.cpp
-      src/ion/LinearScan.cpp
-      src/ion/LIR.cpp
-      src/ion/LiveRangeAllocator.cpp
-      src/ion/Lowering.cpp
-      src/ion/MCallOptimize.cpp
-      src/ion/MIR.cpp
-      src/ion/MIRGraph.cpp
-      src/ion/MoveResolver.cpp
-      src/ion/ParallelArrayAnalysis.cpp
-      src/ion/ParallelFunctions.cpp
-      src/ion/RangeAnalysis.cpp
-      src/ion/RegisterAllocator.cpp
-      src/ion/Safepoints.cpp
-      src/ion/Snapshots.cpp
-      src/ion/StupidAllocator.cpp
-      src/ion/TypeOracle.cpp
-      src/ion/TypePolicy.cpp
-      src/ion/UnreachableCodeElimination.cpp
-      src/ion/ValueNumbering.cpp
-      src/ion/VMFunctions.cpp)
-  endif()
-
-  if(ENABLE_ION)
-    list(APPEND JS_SRCS
-      src/ion/shared/Assembler-x86-shared.cpp
-      src/ion/shared/CodeGenerator-x86-shared.cpp
-      src/ion/shared/IonFrames-x86-shared.cpp
-      src/ion/shared/Lowering-x86-shared.cpp
-      src/ion/shared/MoveEmitter-x86-shared.cpp)
-  endif()
-
-  if(PLATFORM_ARCH == 64)
-    if(WIN32)
-      list(APPEND JS_SRCS
-        src/methodjit/TrampolineMasmX64.asm)
-    endif()
-    
-    if(ENABLE_ION)
-      list(APPEND JS_SRCS
-        src/ion/x64/Assembler-x64.cpp
-        src/ion/x64/CodeGenerator-x64.cpp
-        src/ion/x64/IonFrames-x64.cpp
-        src/ion/x64/Lowering-x64.cpp
-        src/ion/x64/MoveEmitter-x64.cpp)
-    endif()
+      src/jit/x64/Assembler-x64.cpp
+      src/jit/x64/Bailouts-x64.cpp
+      src/jit/x64/BaselineCompiler-x64.cpp
+      src/jit/x64/BaselineIC-x64.cpp
+      src/jit/x64/CodeGenerator-x64.cpp
+      src/jit/x64/Lowering-x64.cpp
+      src/jit/x64/MacroAssembler-x64.cpp
+      src/jit/x64/Trampoline-x64.cpp)
   else()
-    if(ENABLE_ION)
-      list(APPEND JS_SRCS
-        src/ion/x86/Assembler-x86.cpp
-        src/ion/x86/CodeGenerator-x86.cpp
-        src/ion/x86/IonFrames-x86.cpp
-        src/ion/x86/Lowering-x86.cpp
-        src/ion/x86/MoveEmitter-x86.cpp)
-    endif()
+    list(APPEND JS_SRCS
+      src/jit/x86/Assembler-x86.cpp
+      src/jit/x86/Bailouts-x86.cpp
+      src/jit/x86/BaselineCompiler-x86.cpp
+      src/jit/x86/BaselineIC-x86.cpp
+      src/jit/x86/CodeGenerator-x86.cpp
+      src/jit/x86/Lowering-x86.cpp
+      src/jit/x86/MacroAssembler-x86.cpp
+      src/jit/x86/Trampoline-x86.cpp)
   endif()
-endif()
-
-list(APPEND JS_SRCS
-  src/assembler/jit/ExecutableAllocator.cpp
-
-  src/yarr/PageBlock.cpp
-  src/yarr/YarrCanonicalizeUCS2.cpp
-  src/yarr/YarrInterpreter.cpp
-  src/yarr/YarrPattern.cpp
-  src/yarr/YarrSyntaxChecker.cpp)
-
-if(ENABLE_METHODJIT_SPEW)
-  list(APPEND JS_SRCS
-    src/methodjit/Logging.cpp)
 endif()
 
 if(WIN32)
@@ -238,13 +227,15 @@ endif()
 
 #TODO
 #ifneq (,$(filter arm% sparc %86 x86_64 mips%,$(TARGET_CPU)))
-if(ENABLE_METHODJIT OR ENABLE_ION OR ENABLE_YARR_JIT)
-  add_definitions(-DENABLE_YARR_JIT=1)
-
+if(ENABLE_ION OR ENABLE_YARR_JIT)
   list(APPEND JS_SRCS
     src/assembler/assembler/ASMAssembler.cpp
     src/assembler/assembler/MacroAssemblerASM.cpp
-    src/assembler/assembler/MacroAssemblerX86Common.cpp
+    src/assembler/assembler/MacroAssemblerX86Common.cpp)
+endif()
+
+if(ENABLE_YARR_JIT)
+  list(APPEND JS_SRCS
     src/yarr/YarrJIT.cpp)
 endif()
 
@@ -252,6 +243,14 @@ if(JS_HAS_CTYPES)
   list(APPEND JS_SRCS
     src/ctypes/CTypes.cpp
     src/ctypes/Library.cpp)
+endif()
+
+if(HAVE_LINUX_PERF_EVENT_H)
+  list(APPEND JS_SRCS
+    src/perf/pm_linux.cpp)
+else()
+  list(APPEND JS_SRCS
+    src/perf/pm_stub.cpp)
 endif()
 ## End source files
 ###############################################################################
@@ -263,6 +262,8 @@ add_dependencies(js host_jsoplengen)
 target_include_directories(js
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/assembler
+    ${CMAKE_CURRENT_SOURCE_DIR}/../intl/icu/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../intl/icu/src/i18n
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/public
     # $:/src and BIN_DIR should be private but make public for now until
@@ -307,20 +308,19 @@ target_sources(js PRIVATE jsautooplen.h)
 set(SELFHOSTING_SRCS
   src/builtin/Utilities.js
   src/builtin/Array.js
+  src/builtin/Date.js
   src/builtin/Intl.js
-  src/builtin/IntlData.js)
+  src/builtin/IntlData.js
+  src/builtin/Number.js
+  src/builtin/ParallelArray.js
+  src/builtin/String.js)
 
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   # HINT: /EP flag is required for MSVC C++ compiler to work
-  COMMAND py src/builtin/embedjs.py -d ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h src/js.msg src/builtin/macros.py ${SELFHOSTING_SRCS}
-  DEPENDS
-    ${SELFHOSTING_SRCS}
-    src/builtin/embedjs.py
-    src/builtin/js2c.py
-    src/builtin/macros.py
-    src/js.msg
+  COMMAND py src/builtin/embedjs.py -DDEBUG=1 -p "${CMAKE_CXX_COMPILER} /EP" -m src/js.msg -o ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.out.h -s ${CMAKE_CURRENT_BINARY_DIR}/selfhosted.js ${SELFHOSTING_SRCS}
+  DEPENDS ${SELFHOSTING_SRCS} src/js.msg
   COMMENT "Generating selfhosted.out.h"
   VERBATIM)
 
@@ -336,6 +336,7 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/public/js"
 
 set(JS_PUBLIC_HDRS
   ${CMAKE_CURRENT_BINARY_DIR}/js-config.h
+  src/perf/jsperf.h
   src/js.msg
   src/jsapi.h
   src/jsalloc.h
@@ -343,18 +344,14 @@ set(JS_PUBLIC_HDRS
   src/jsclist.h
   src/jscpucfg.h
   src/jsdbgapi.h
-  src/jsdhash.h
   src/jsfriendapi.h
   src/jslock.h
-  src/json.h
   src/jsproxy.h
   src/jsprf.h
   src/jsprototypes.h
   src/jsprvtd.h
   src/jspubtd.h
   src/jstypes.h
-  src/jstypes.h
-  src/jsutil.h
   src/jsutil.h
   src/jsversion.h
   src/jswrapper.h)
@@ -364,8 +361,5 @@ install(FILES ${JS_PUBLIC_HDRS}
 
 install(FILES src/ds/BitArray.h
   DESTINATION ${CMAKE_INSTALL_PREFIX}/include/ds)
-
-install(FILES src/gc/Root.h
-  DESTINATION ${CMAKE_INSTALL_PREFIX}/include/gc)
 ## End install directives
 ###############################################################################

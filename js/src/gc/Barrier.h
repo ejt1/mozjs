@@ -1,18 +1,17 @@
 /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=8 sw=4 et tw=78:
- *
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#ifndef jsgc_barrier_h___
-#define jsgc_barrier_h___
+#ifndef gc_Barrier_h
+#define gc_Barrier_h
 
 #include "jsapi.h"
 
 #include "gc/Heap.h"
-#include "gc/Root.h"
 #include "js/HashTable.h"
+#include "js/RootingAPI.h"
 
 /*
  * A write barrier is a mechanism used by incremental or generation GCs to
@@ -255,7 +254,7 @@ class RelocatablePtr : public EncapsulatedPtr<T>
         if (v)
             post();
     }
-    explicit RelocatablePtr(const RelocatablePtr<T> &v) : EncapsulatedPtr<T>(v) {
+    RelocatablePtr(const RelocatablePtr<T> &v) : EncapsulatedPtr<T>(v) {
         if (this->value)
             post();
     }
@@ -331,6 +330,7 @@ typedef RelocatablePtr<JSScript> RelocatablePtrScript;
 typedef HeapPtr<JSObject> HeapPtrObject;
 typedef HeapPtr<JSFunction> HeapPtrFunction;
 typedef HeapPtr<JSString> HeapPtrString;
+typedef HeapPtr<PropertyName> HeapPtrPropertyName;
 typedef HeapPtr<JSScript> HeapPtrScript;
 typedef HeapPtr<Shape> HeapPtrShape;
 typedef HeapPtr<BaseShape> HeapPtrBaseShape;
@@ -374,14 +374,22 @@ class EncapsulatedValue : public ValueOperations<EncapsulatedValue>
      * implementations.
      */
     EncapsulatedValue() MOZ_DELETE;
-    EncapsulatedValue(const EncapsulatedValue &v) MOZ_DELETE;
-    EncapsulatedValue &operator=(const Value &v) MOZ_DELETE;
-    EncapsulatedValue &operator=(const EncapsulatedValue &v) MOZ_DELETE;
-
-    EncapsulatedValue(const Value &v) : value(v) {}
-    ~EncapsulatedValue() {}
 
   public:
+    EncapsulatedValue(const Value &v) : value(v) {
+        JS_ASSERT(!IsPoisonedValue(v));
+    }
+    EncapsulatedValue(const EncapsulatedValue &v) : value(v) {
+        JS_ASSERT(!IsPoisonedValue(v));
+    }
+    inline ~EncapsulatedValue();
+
+    inline void init(const Value &v);
+    inline void init(JSRuntime *rt, const Value &v);
+
+    inline EncapsulatedValue &operator=(const Value &v);
+    inline EncapsulatedValue &operator=(const EncapsulatedValue &v);
+
     bool operator==(const EncapsulatedValue &v) const { return value == v.value; }
     bool operator!=(const EncapsulatedValue &v) const { return value != v.value; }
 
@@ -453,8 +461,7 @@ class RelocatableValue : public EncapsulatedValue
 
   private:
     inline void post();
-    inline void post(JSRuntime *rt);
-    inline void relocate();
+    inline void relocate(JSRuntime *rt);
 };
 
 class HeapSlot : public EncapsulatedValue
@@ -500,19 +507,6 @@ class HeapSlot : public EncapsulatedValue
  */
 inline void
 DenseRangeWriteBarrierPost(JSRuntime *rt, JSObject *obj, uint32_t start, uint32_t count);
-
-/*
- * This is a post barrier for HashTables whose key can be moved during a GC.
- */
-template <class Map, class Key>
-inline void
-HashTableWriteBarrierPost(JSRuntime *rt, const Map *map, const Key &key)
-{
-#ifdef JS_GCGENERATIONAL
-    if (key && comp->gcNursery.isInside(key))
-        comp->gcStoreBuffer.putGeneric(HashKeyRef(map, key));
-#endif
-}
 
 static inline const Value *
 Valueify(const EncapsulatedValue *array)
@@ -617,7 +611,6 @@ class ReadBarriered
   public:
     ReadBarriered() : value(NULL) {}
     ReadBarriered(T *value) : value(value) {}
-    ReadBarriered(const Unrooted<T*> &unrooted) : value(unrooted) {}
     ReadBarriered(const Rooted<T*> &rooted) : value(rooted) {}
 
     T *get() const {
@@ -666,4 +659,4 @@ template <> struct IsRelocatableHeapType<HeapId>    { static const bool result =
 } /* namespace tl */
 } /* namespace js */
 
-#endif /* jsgc_barrier_h___ */
+#endif /* gc_Barrier_h */

@@ -1,7 +1,11 @@
 mozilla_prepare_tests(mfbt
+  TestAtomics
   TestBloomFilter
+  TestCasting
   TestCheckedInt
+  TestEndian
   TestEnumSet
+  TestPoisonArea
   TestSHA1
   TestTypeTraits
   TestWeakPtr)

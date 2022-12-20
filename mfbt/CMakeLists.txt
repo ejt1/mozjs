@@ -1,4 +1,6 @@
 set(MFBT_SRCS
+  src/decimal/Decimal.cpp
+
   src/double-conversion/bignum.cc
   src/double-conversion/bignum-dtoa.cc
   src/double-conversion/cached-powers.cc
@@ -9,12 +11,14 @@ set(MFBT_SRCS
   src/double-conversion/strtod.cc
 
   src/mozilla/HashFunctions.cpp
+  src/mozilla/Poison.cpp
   src/mozilla/SHA1.cpp)
 
 add_library(mfbt ${MFBT_SRCS})
 
 target_include_directories(mfbt
   PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/decimal
     ${CMAKE_CURRENT_SOURCE_DIR}/src/double-conversion
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -25,13 +29,16 @@ install(TARGETS mfbt
 
 set(MFBT_PUBLIC_HDRS
   src/mozilla/Assertions.h
+  src/mozilla/Atomics.h
   src/mozilla/Attributes.h
   src/mozilla/BloomFilter.h
+  src/mozilla/Casting.h
   src/mozilla/Char16.h
   src/mozilla/CheckedInt.h
   src/mozilla/Compiler.h
   src/mozilla/Constants.h
   src/mozilla/DebugOnly.h
+  src/mozilla/Endian.h
   src/mozilla/EnumSet.h
   src/mozilla/FloatingPoint.h
   src/mozilla/GuardObjects.h
@@ -42,6 +49,8 @@ set(MFBT_PUBLIC_HDRS
   src/mozilla/MemoryChecking.h
   src/mozilla/MSStdInt.h
   src/mozilla/NullPtr.h
+  src/mozilla/PodOperations.h
+  src/mozilla/Poison.h
   src/mozilla/Range.h
   src/mozilla/RangedPtr.h
   src/mozilla/RefPtr.h
@@ -58,3 +67,6 @@ set(MFBT_PUBLIC_HDRS
 
 install(FILES ${MFBT_PUBLIC_HDRS}
   DESTINATION ${CMAKE_INSTALL_PREFIX}/include/mozilla)
+
+install(FILES src/decimal/Decimal.h
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/include/mozilla/decimal)

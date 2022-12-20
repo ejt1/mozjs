@@ -25,14 +25,17 @@ set(JSAPI_TEST_SRCS
   testDefineProperty.cpp
   testEnclosingFunction.cpp
   testErrorCopying.cpp
+  testException.cpp
   testExternalStrings.cpp
   testFindSCCs.cpp
   testFuncCallback.cpp
   testFunctionProperties.cpp
+  testGCExactRooting.cpp
   testGCFinalizeCallback.cpp
   testGCOutOfMemory.cpp
   testGetPropertyDefault.cpp
   testHashTable.cpp
+  testHashTableInit.cpp
   testIndexToString.cpp
   testIntern.cpp
   testIntString.cpp
@@ -56,10 +59,10 @@ set(JSAPI_TEST_SRCS
   testSetProperty.cpp
   testSourcePolicy.cpp
   testStringBuffer.cpp
+  testToIntWidth.cpp
   testTrap.cpp
   testTypedArrays.cpp
   testUTF8.cpp
-  testVersion.cpp
   testXDR.cpp)
 
 add_executable(jsapi-tests ${JSAPI_TEST_SRCS})

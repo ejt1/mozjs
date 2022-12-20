@@ -1,6 +1,6 @@
-/* -*- Mode: C++; c-basic-offset: 4; tab-width: 4; indent-tabs-mode: nil -*- */
-/* vim: set ts=4 sw=4 et tw=99: */
-/* This Source Code Form is subject to the terms of the Mozilla Public
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
+ * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
@@ -9,6 +9,7 @@
 
 #include "jsapi.h"
 #include "jsclass.h"
+#include "jsfriendapi.h"
 #include "jsobj.h"
 
 #include "gc/Barrier.h"
@@ -33,8 +34,10 @@ class ArrayBufferObject : public JSObject
     static bool fun_slice_impl(JSContext *cx, CallArgs args);
 
   public:
+    static Class class_;
+
     static Class protoClass;
-    static JSFunctionSpec jsfuncs[];
+    static const JSFunctionSpec jsfuncs[];
 
     static JSBool byteLengthGetter(JSContext *cx, unsigned argc, Value *vp);
 
@@ -56,7 +59,7 @@ class ArrayBufferObject : public JSObject
     template<typename T>
     static JSBool createTypedArrayFromBuffer(JSContext *cx, unsigned argc, Value *vp);
 
-    static void obj_trace(JSTracer *trc, RawObject obj);
+    static void obj_trace(JSTracer *trc, JSObject *obj);
 
     static JSBool obj_lookupGeneric(JSContext *cx, HandleObject obj, HandleId id,
                                     MutableHandleObject objp, MutableHandleShape propp);
@@ -119,15 +122,12 @@ class ArrayBufferObject : public JSObject
     static JSBool obj_setSpecialAttributes(JSContext *cx, HandleObject obj,
                                            HandleSpecialId sid, unsigned *attrsp);
 
-    static JSBool obj_deleteProperty(JSContext *cx, HandleObject obj,
-                                     HandlePropertyName name, MutableHandleValue rval,
-                                     JSBool strict);
-    static JSBool obj_deleteElement(JSContext *cx, HandleObject obj,
-                                    uint32_t index, MutableHandleValue rval,
-                                    JSBool strict);
-    static JSBool obj_deleteSpecial(JSContext *cx, HandleObject obj,
-                                    HandleSpecialId sid, MutableHandleValue rval,
-                                    JSBool strict);
+    static JSBool obj_deleteProperty(JSContext *cx, HandleObject obj, HandlePropertyName name,
+                                     JSBool *succeeded);
+    static JSBool obj_deleteElement(JSContext *cx, HandleObject obj, uint32_t index,
+                                    JSBool *succeeded);
+    static JSBool obj_deleteSpecial(JSContext *cx, HandleObject obj, HandleSpecialId sid,
+                                    JSBool *succeeded);
 
     static JSBool obj_enumerate(JSContext *cx, HandleObject obj, JSIterateOp enum_op,
                                 MutableHandleValue statep, MutableHandleId idp);
@@ -138,15 +138,34 @@ class ArrayBufferObject : public JSObject
     static bool saveArrayBufferList(JSCompartment *c, ArrayBufferVector &vector);
     static void restoreArrayBufferLists(ArrayBufferVector &vector);
 
-    static bool stealContents(JSContext *cx, JSObject *obj, void **contents,
-                              uint8_t **data);
+    bool hasStealableContents() const {
+        // Inline elements strictly adhere to the corresponding buffer.
+        if (!hasDynamicElements())
+            return false;
+
+        // asm.js buffer contents are transferred by copying, just like inline
+        // elements.
+        if (isAsmJSArrayBuffer())
+            return false;
+
+        // Neutered contents aren't transferrable because we want a neutered
+        // array's contents to be backed by zeroed memory equal in length to
+        // the original buffer contents.  Transferring these contents would
+        // allocate new ones based on the current byteLength, which is 0 for a
+        // neutered array -- not the original byteLength.
+        return !isNeutered();
+    }
+
+    static bool stealContents(JSContext *cx, JSObject *obj, NeuterDataDisposition changeData,
+                              void **contents, uint8_t **data);
 
     static inline void setElementsHeader(js::ObjectElements *header, uint32_t bytes);
+    static inline uint32_t getElementsHeaderInitializedLength(const js::ObjectElements *header);
 
-    void addView(RawObject view);
+    void addView(JSObject *view);
 
     bool allocateSlots(JSContext *cx, uint32_t size, uint8_t *contents = NULL);
-    void changeContents(ObjectElements *newHeader);
+    void changeContents(JSContext *cx, ObjectElements *newHeader);
 
     /*
      * Ensure that the data is not stored inline. Used when handing back a
@@ -164,6 +183,17 @@ class ArrayBufferObject : public JSObject
      */
     inline bool hasData() const;
 
+    bool isAsmJSArrayBuffer() const {
+        return getElementsHeader()->isAsmJSArrayBuffer();
+    }
+
+    static bool prepareForAsmJS(JSContext *cx, Handle<ArrayBufferObject*> buffer);
+    static void neuterAsmJSArrayBuffer(ArrayBufferObject &buffer);
+    static void releaseAsmJSArrayBuffer(FreeOp *fop, JSObject *obj);
+
+    bool isNeutered() const {
+        return getElementsHeader()->isNeuteredBuffer();
+    }
 };
 
 /*
@@ -279,7 +309,7 @@ struct TypedArray : public BufferView {
   public:
     static bool isArrayIndex(JSObject *obj, jsid id, uint32_t *ip = NULL);
 
-    static void neuter(RawObject tarray);
+    static void neuter(JSObject *view);
 
     static inline uint32_t slotWidth(int atype);
     static inline int slotWidth(JSObject *obj);
@@ -293,6 +323,9 @@ struct TypedArray : public BufferView {
     static int lengthOffset();
     static int dataOffset();
 };
+
+MOZ_STATIC_ASSERT(js::detail::TypedArrayLengthSlot == TypedArray::LENGTH_SLOT,
+                  "bad inlined constant in jsfriendapi.h");
 
 inline bool
 IsTypedArrayClass(const Class *clasp)
@@ -308,14 +341,48 @@ IsTypedArrayProtoClass(const Class *clasp)
            clasp < &TypedArray::protoClasses[TypedArray::TYPE_MAX];
 }
 
+bool
+IsTypedArrayConstructor(const Value &v, uint32_t type);
+
+bool
+IsTypedArrayBuffer(const Value &v);
+
+static inline unsigned
+TypedArrayShift(ArrayBufferView::ViewType viewType)
+{
+    switch (viewType) {
+      case ArrayBufferView::TYPE_INT8:
+      case ArrayBufferView::TYPE_UINT8:
+      case ArrayBufferView::TYPE_UINT8_CLAMPED:
+        return 0;
+      case ArrayBufferView::TYPE_INT16:
+      case ArrayBufferView::TYPE_UINT16:
+        return 1;
+      case ArrayBufferView::TYPE_INT32:
+      case ArrayBufferView::TYPE_UINT32:
+      case ArrayBufferView::TYPE_FLOAT32:
+        return 2;
+      case ArrayBufferView::TYPE_FLOAT64:
+        return 3;
+      default:;
+    }
+    JS_NOT_REACHED("Unexpected array type");
+    return 0;
+}
+
 class DataViewObject : public JSObject, public BufferView
 {
 public:
+    static Class class_;
 
 private:
     static Class protoClass;
 
     static inline bool is(const Value &v);
+
+    template <typename NativeType>
+    static uint8_t *
+    getDataPointer(JSContext *cx, Handle<DataViewObject*> obj, uint32_t offset);
 
     template<Value ValueGetter(DataViewObject &view)>
     static bool
@@ -400,8 +467,6 @@ private:
     inline void *dataPointer();
     inline bool hasBuffer() const;
     static JSObject *initClass(JSContext *cx);
-    static bool getDataPointer(JSContext *cx, Handle<DataViewObject*> obj,
-                               CallArgs args, size_t typeSize, uint8_t **data);
     template<typename NativeType>
     static bool read(JSContext *cx, Handle<DataViewObject*> obj,
                      CallArgs &args, NativeType *val, const char *method);
@@ -409,7 +474,7 @@ private:
     static bool write(JSContext *cx, Handle<DataViewObject*> obj,
                       CallArgs &args, const char *method);
   private:
-    static JSFunctionSpec jsfuncs[];
+    static const JSFunctionSpec jsfuncs[];
 };
 
 bool

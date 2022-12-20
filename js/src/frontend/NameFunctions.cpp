@@ -1,18 +1,20 @@
 /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=8 sw=4 et tw=99:
- *
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "frontend/NameFunctions.h"
-#include "frontend/ParseNode.h"
-#include "frontend/SharedContext.h"
 
 #include "jsfun.h"
 #include "jsprf.h"
 
-#include "vm/String-inl.h"
+#include "frontend/BytecodeCompiler.h"
+#include "frontend/ParseNode.h"
+#include "frontend/SharedContext.h"
+
+#include "jsfuninlines.h"
+
 #include "vm/StringBuffer.h"
 
 using namespace js;
@@ -175,8 +177,6 @@ class NameResolver
     JSAtom *resolveFun(ParseNode *pn, HandleAtom prefix) {
         JS_ASSERT(pn != NULL && pn->isKind(PNK_FUNCTION));
         RootedFunction fun(cx, pn->pn_funbox->function());
-        if (nparents == 0)
-            return NULL;
 
         StringBuffer buf(cx);
         this->buf = &buf;
@@ -184,7 +184,7 @@ class NameResolver
         /* If the function already has a name, use that */
         if (fun->displayAtom() != NULL) {
             if (prefix == NULL)
-                return fun->atom();
+                return fun->displayAtom();
             if (!buf.append(prefix) ||
                 !buf.append("/") ||
                 !buf.append(fun->displayAtom()))
@@ -246,7 +246,9 @@ class NameResolver
         if (buf.empty())
             return NULL;
 
-        UnrootedAtom atom = buf.finishAtom();
+        JSAtom *atom = buf.finishAtom();
+        if (!atom)
+            return NULL;
         fun->setGuessedAtom(atom);
         return atom;
     }
@@ -273,7 +275,7 @@ class NameResolver
         if (cur == NULL)
             return;
 
-        if (cur->isKind(PNK_FUNCTION) && cur->isArity(PN_FUNC)) {
+        if (cur->isKind(PNK_FUNCTION) && cur->isArity(PN_CODE)) {
             RootedAtom prefix2(cx, resolveFun(cur, prefix));
             /*
              * If a function looks like (function(){})() where the parent node
@@ -314,8 +316,8 @@ class NameResolver
             resolve(cur->pn_kid2, prefix);
             resolve(cur->pn_kid3, prefix);
             break;
-          case PN_FUNC:
-            JS_ASSERT(cur->isKind(PNK_FUNCTION));
+          case PN_CODE:
+            JS_ASSERT(cur->isKind(PNK_MODULE) || cur->isKind(PNK_FUNCTION));
             resolve(cur->pn_body, prefix);
             break;
           case PN_LIST:

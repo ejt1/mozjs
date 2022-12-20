@@ -1,5 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=8 sw=4 et tw=99:
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  */
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -59,6 +59,11 @@ template<JSObject *Create(JSContext *, uint32_t),
 bool
 TestPlainTypedArray(JSContext *cx)
 {
+    {
+        RootedObject notArray(cx, Create(cx, UINT32_MAX));
+        CHECK(!notArray);
+    }
+
     RootedObject array(cx, Create(cx, 7));
     CHECK(JS_IsTypedArrayObject(array));
     RootedObject proto(cx);
@@ -95,6 +100,11 @@ TestArrayFromBuffer(JSContext *cx)
     CHECK(bufdata = JS_GetArrayBufferData(buffer));
     memset(bufdata, 1, nbytes);
 
+    {
+        RootedObject notArray(cx, CreateWithBuffer(cx, buffer, UINT32_MAX, -1));
+        CHECK(!notArray);
+    }
+
     RootedObject array(cx, CreateWithBuffer(cx, buffer, 0, -1));
     CHECK_EQUAL(JS_GetTypedArrayLength(array), elts);
     CHECK_EQUAL(JS_GetTypedArrayByteOffset(array), 0);
@@ -120,9 +130,9 @@ TestArrayFromBuffer(JSContext *cx)
     CHECK_EQUAL(JS_GetTypedArrayByteLength(ofsArray), nbytes / 2);
 
     // Make sure all 3 views reflect the same buffer at the expected locations
-    js::RootedValue v(cx, INT_TO_JSVAL(39));
+    JS::RootedValue v(cx, INT_TO_JSVAL(39));
     JS_SetElement(cx, array, 0, v.address());
-    js::RootedValue v2(cx);
+    JS::RootedValue v2(cx);
     CHECK(JS_GetElement(cx, array, 0, v2.address()));
     CHECK_SAME(v, v2);
     CHECK(JS_GetElement(cx, shortArray, 0, v2.address()));
@@ -145,7 +155,7 @@ TestArrayFromBuffer(JSContext *cx)
     CHECK_SAME(v, v2);
     CHECK_EQUAL(long(JSVAL_TO_INT(v)), long(reinterpret_cast<Element*>(data)[elts - 1]));
 
-    js::RootedObject copy(cx, CreateFromArray(cx, array));
+    JS::RootedObject copy(cx, CreateFromArray(cx, array));
     CHECK(JS_GetElement(cx, array, 0, v.address()));
     CHECK(JS_GetElement(cx, copy, 0, v2.address()));
     CHECK_SAME(v, v2);

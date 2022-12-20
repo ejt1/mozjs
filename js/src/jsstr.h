@@ -1,12 +1,13 @@
-/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=4 sw=4 et tw=79 ft=cpp:
- *
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#ifndef jsstr_h___
-#define jsstr_h___
+#ifndef jsstr_h
+#define jsstr_h
+
+#include "mozilla/PodOperations.h"
 
 #include <ctype.h>
 #include "jsapi.h"
@@ -59,8 +60,8 @@ struct JSSubString {
     const jschar    *chars;
 };
 
-extern jschar      js_empty_ucstr[];
-extern JSSubString js_EmptySubString;
+extern const jschar js_empty_ucstr[];
+extern const JSSubString js_EmptySubString;
 
 /*
  * Shorthands for ASCII (7-bit) decimal and hex conversion.
@@ -125,7 +126,7 @@ namespace js {
  */
 template <AllowGC allowGC>
 extern JSString *
-ToStringSlow(JSContext *cx, const Value &v);
+ToStringSlow(JSContext *cx, typename MaybeRooted<Value, allowGC>::HandleType arg);
 
 /*
  * Convert the given value to a string.  This method includes an inline
@@ -134,7 +135,7 @@ ToStringSlow(JSContext *cx, const Value &v);
  */
 template <AllowGC allowGC>
 static JS_ALWAYS_INLINE JSString *
-ToString(JSContext *cx, const js::Value &v)
+ToString(JSContext *cx, JS::HandleValue v)
 {
 #ifdef DEBUG
     if (allowGC) {
@@ -194,6 +195,11 @@ CompareStrings(JSContext *cx, JSString *str1, JSString *str2, int32_t *result);
 extern bool
 StringEqualsAscii(JSLinearString *str, const char *asciiBytes);
 
+/* Return true if the string contains a pattern anywhere inside it. */
+extern bool
+StringHasPattern(const jschar *text, uint32_t textlen,
+                 const jschar *pat, uint32_t patlen);
+
 } /* namespace js */
 
 extern size_t
@@ -208,7 +214,7 @@ js_strchr_limit(const jschar *s, jschar c, const jschar *limit);
 static JS_ALWAYS_INLINE void
 js_strncpy(jschar *dst, const jschar *src, size_t nelem)
 {
-    return js::PodCopy(dst, src, nelem);
+    return mozilla::PodCopy(dst, src, nelem);
 }
 
 extern jschar *
@@ -246,6 +252,16 @@ InflateStringToBuffer(JSContext *cx, const char *bytes, size_t length,
 extern bool
 InflateUTF8StringToBuffer(JSContext *cx, const char *bytes, size_t length,
                           jschar *chars, size_t *charsLength);
+
+/*
+ * The same as InflateUTF8StringToBuffer(), except that any malformed UTF-8
+ * characters will be replaced by \uFFFD. No exception will be thrown for
+ * malformed UTF-8 input.
+ */
+extern bool
+InflateUTF8StringToBufferReplaceInvalid(JSContext *cx, const char *bytes,
+                                        size_t length, jschar *chars,
+                                        size_t *charsLength);
 
 /*
  * Deflate JS chars to bytes into a buffer. 'bytes' must be large enough for
@@ -334,4 +350,4 @@ str_split(JSContext *cx, unsigned argc, Value *vp);
 extern JSBool
 js_String(JSContext *cx, unsigned argc, js::Value *vp);
 
-#endif /* jsstr_h___ */
+#endif /* jsstr_h */

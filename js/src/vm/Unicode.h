@@ -1,17 +1,13 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
+ * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#ifndef Unicode_h__
-#define Unicode_h__
-
-#include "mozilla/StandardInteger.h"
+#ifndef vm_Unicode_h
+#define vm_Unicode_h
 
 #include "jspubtd.h"
-
-#ifdef DEBUG
-#include <stdio.h> /* For EOF */
-#endif
 
 extern const bool js_isidstart[];
 extern const bool js_isident[];
@@ -120,8 +116,9 @@ extern const CharacterInfo js_charinfo[];
 inline const CharacterInfo&
 CharInfo(jschar code)
 {
-    size_t index = index1[code >> 6];
-    index = index2[(index << 6) + (code & 0x3f)];
+    const size_t shift = 5;
+    size_t index = index1[code >> shift];
+    index = index2[(index << shift) + (code & ((1 << shift) - 1))];
 
     return js_charinfo[index];
 }
@@ -227,4 +224,4 @@ ToLowerCase(jschar ch)
 } /* namespace unicode */
 } /* namespace js */
 
-#endif /* Unicode_h__ */
+#endif /* vm_Unicode_h */

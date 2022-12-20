@@ -1,9 +1,11 @@
 /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=8 sw=4 et tw=99:
- *
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jsapi_tests_tests_h
+#define jsapi_tests_tests_h
 
 #include "mozilla/Util.h"
 
@@ -13,7 +15,6 @@
 
 // For js::gc::AutoSuppressGC
 #include "jsgc.h"
-#include "jsobjinlines.h"
 #include "jsgcinlines.h"
 
 #include "js/Vector.h"
@@ -80,6 +81,7 @@ class JSAPITest
         }
         if (cx) {
             JS_RemoveObjectRoot(cx, &global);
+            JS_LeaveCompartment(cx, NULL);
             JS_EndRequest(cx);
             JS_DestroyContext(cx);
             cx = NULL;
@@ -188,7 +190,7 @@ class JSAPITest
                    const char *actualExpr, const char *expectedExpr,
                    const char *filename, int lineno) {
         JSBool same;
-        js::RootedValue actual(cx, actualArg), expected(cx, expectedArg);
+        JS::RootedValue actual(cx, actualArg), expected(cx, expectedArg);
         return (JS_SameValue(cx, actual, expected, &same) && same) ||
                fail(JSAPITestString("CHECK_SAME failed: expected JS_SameValue(cx, ") +
                     actualExpr + ", " + expectedExpr + "), got !JS_SameValue(cx, " +
@@ -210,7 +212,7 @@ class JSAPITest
     bool fail(JSAPITestString msg = JSAPITestString(), const char *filename = "-", int lineno = 0) {
         if (JS_IsExceptionPending(cx)) {
             js::gc::AutoSuppressGC gcoff(cx);
-            js::RootedValue v(cx);
+            JS::RootedValue v(cx);
             JS_GetPendingException(cx, v.address());
             JS_ClearPendingException(cx);
             JSString *s = JS_ValueToString(cx, v);
@@ -230,7 +232,7 @@ class JSAPITest
     static JSClass * basicGlobalClass() {
         static JSClass c = {
             "global", JSCLASS_GLOBAL_FLAGS,
-            JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
+            JS_PropertyStub, JS_DeletePropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
             JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub
         };
         return &c;
@@ -300,7 +302,6 @@ class JSAPITest
         if (!cx)
             return NULL;
         JS_SetOptions(cx, JSOPTION_VAROBJFIX);
-        JS_SetVersion(cx, JSVERSION_LATEST);
         JS_SetErrorReporter(cx, &reportError);
         return cx;
     }
@@ -398,3 +399,5 @@ class TempFile {
         name = NULL;
     }
 };
+
+#endif /* jsapi_tests_tests_h */

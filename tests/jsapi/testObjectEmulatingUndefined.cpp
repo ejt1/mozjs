@@ -8,7 +8,7 @@ static JSClass ObjectEmulatingUndefinedClass = {
     "ObjectEmulatingUndefined",
     JSCLASS_EMULATES_UNDEFINED,
     JS_PropertyStub,
-    JS_PropertyStub,
+    JS_DeletePropertyStub,
     JS_PropertyStub,
     JS_StrictPropertyStub,
     JS_EnumerateStub,
@@ -31,7 +31,7 @@ BEGIN_TEST(testObjectEmulatingUndefined_truthy)
     CHECK(JS_InitClass(cx, global, NULL, &ObjectEmulatingUndefinedClass,
                        ObjectEmulatingUndefinedConstructor, 0, NULL, NULL, NULL, NULL));
 
-    js::RootedValue result(cx);
+    JS::RootedValue result(cx);
 
     EVAL("if (new ObjectEmulatingUndefined()) true; else false;", result.address());
     CHECK_SAME(result, JSVAL_FALSE);
@@ -56,7 +56,7 @@ BEGIN_TEST(testObjectEmulatingUndefined_equal)
     CHECK(JS_InitClass(cx, global, NULL, &ObjectEmulatingUndefinedClass,
                        ObjectEmulatingUndefinedConstructor, 0, NULL, NULL, NULL, NULL));
 
-    js::RootedValue result(cx);
+    JS::RootedValue result(cx);
 
     EVAL("if (new ObjectEmulatingUndefined() == undefined) true; else false;", result.address());
     CHECK_SAME(result, JSVAL_TRUE);

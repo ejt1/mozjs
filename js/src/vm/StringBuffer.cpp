@@ -1,8 +1,8 @@
 /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- *
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this file,
- * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "vm/StringBuffer.h"
 
@@ -38,27 +38,27 @@ StringBuffer::extractWellSized()
     return buf;
 }
 
-UnrootedFlatString
+JSFlatString *
 StringBuffer::finishString()
 {
     JSContext *cx = context();
     if (cb.empty())
-        return UnrootedFlatString(cx->names().empty);
+        return cx->names().empty;
 
     size_t length = cb.length();
     if (!JSString::validateLength(cx, length))
-        return UnrootedFlatString();
+        return NULL;
 
     JS_STATIC_ASSERT(JSShortString::MAX_SHORT_LENGTH < CharBuffer::InlineLength);
     if (JSShortString::lengthFits(length))
         return NewShortString<CanGC>(cx, TwoByteChars(cb.begin(), length));
 
     if (!cb.append('\0'))
-        return UnrootedFlatString();
+        return NULL;
 
     jschar *buf = extractWellSized();
     if (!buf)
-        return UnrootedFlatString();
+        return NULL;
 
     JSFlatString *str = js_NewString<CanGC>(cx, buf, length);
     if (!str)
@@ -66,17 +66,16 @@ StringBuffer::finishString()
     return str;
 }
 
-UnrootedAtom
+JSAtom *
 StringBuffer::finishAtom()
 {
-    AssertCanGC();
     JSContext *cx = context();
 
     size_t length = cb.length();
     if (length == 0)
-        return UnrootedAtom(cx->names().empty);
+        return cx->names().empty;
 
-    UnrootedAtom atom = AtomizeChars<CanGC>(cx, cb.begin(), length);
+    JSAtom *atom = AtomizeChars<CanGC>(cx, cb.begin(), length);
     cb.clear();
     return atom;
 }

@@ -1,12 +1,12 @@
 /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
- * vim: set ts=8 sw=4 et tw=99:
+ * vim: set ts=8 sts=4 et sw=4 tw=99:
  */
 
 #include "tests.h"
 
 BEGIN_TEST(testJSEvaluateScript)
 {
-    js::RootedObject obj(cx, JS_NewObject(cx, NULL, NULL, global));
+    JS::RootedObject obj(cx, JS_NewObject(cx, NULL, NULL, global));
     CHECK(obj);
 
     uint32_t options = JS_GetOptions(cx);
@@ -14,7 +14,7 @@ BEGIN_TEST(testJSEvaluateScript)
 
     static const char src[] = "var x = 5;";
 
-    js::RootedValue retval(cx);
+    JS::RootedValue retval(cx);
     CHECK(JS_EvaluateScript(cx, obj, src, sizeof(src) - 1, __FILE__, __LINE__,
                             retval.address()));
 
